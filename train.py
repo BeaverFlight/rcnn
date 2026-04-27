@@ -16,6 +16,11 @@ from torch.utils.data import DataLoader
 from data.collate_fn import collate_tree_rcnn
 from data.newfor_dataset import NewforDataset
 from models.tree_rcnn import TreeRCNN
+from utils.metrics import (
+    extract_tree_positions,
+    newfor_matching,
+    compute_global_metrics,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -55,8 +60,10 @@ def load_checkpoint(
     model: TreeRCNN,
     optimizer: torch.optim.Optimizer,
     path: Path,
+    device: torch.device,
 ) -> tuple[int, float]:
-    ckpt = torch.load(str(path))
+    # map_location гарантирует корректную загрузку с GPU на CPU и наоборот
+    ckpt = torch.load(str(path), map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     logger.info("Resumed from %s (epoch %d)", path, ckpt["epoch"])
@@ -72,6 +79,11 @@ def train_fold(
     out_dir: Path,
     device: torch.device,
 ) -> None:
+    assert cfg.training.batch_size == 1, (
+        "batch_size > 1 is not supported: the current collate/unwrap logic "
+        "assumes a single sample per batch."
+    )
+
     logger.info("=== Fold %d | Train: %s | Val: %s ===", fold_idx, train_ids, val_ids)
 
     train_ds = NewforDataset(
@@ -81,16 +93,22 @@ def train_fold(
         data_root, val_ids, cfg, augment_data=False, max_points=cfg.training.max_points
     )
 
+    num_workers: int = cfg.training.get("num_workers", 0)
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.training.batch_size,
         shuffle=True,
         collate_fn=collate_tree_rcnn,
-        num_workers=0,
+        num_workers=num_workers,
+        pin_memory=(num_workers > 0 and device.type == "cuda"),
     )
 
     model = TreeRCNN(cfg).to(device)
-    optimizer = torch.optim.Adagrad(model.parameters(), lr=cfg.training.learning_rate)
+    optimizer = torch.optim.Adagrad(
+        model.parameters(),
+        lr=cfg.training.learning_rate,
+        weight_decay=cfg.training.get("weight_decay", 0.0),
+    )
 
     ckpt_dir = out_dir / f"fold_{fold_idx}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
@@ -100,7 +118,9 @@ def train_fold(
 
     resume = ckpt_dir / "latest.pth"
     if resume.exists():
-        start_epoch, best_rms = load_checkpoint(model, optimizer, resume)
+        start_epoch, best_rms = load_checkpoint(model, optimizer, resume, device)
+
+    val_interval: int = cfg.training.get("val_interval", 100)
 
     for epoch in range(start_epoch, cfg.training.epochs):
         model.train()
@@ -112,7 +132,7 @@ def train_fold(
             local_maxima = batch["local_maxima"]
             plot_bounds = batch["plot_bounds"]
 
-            # batch_size = 1 → unwrap
+            # batch_size=1 — unwrap list wrapper produced by collate_fn
             if isinstance(points, list):
                 points = points[0]
             if isinstance(gt_boxes, list):
@@ -142,16 +162,16 @@ def train_fold(
             "Epoch %d/%d | Loss: %.4f", epoch + 1, cfg.training.epochs, mean_loss
         )
 
-        # Periodic checkpoint
         if (epoch + 1) % cfg.training.checkpoint_interval == 0:
             save_checkpoint(
                 model, optimizer, epoch + 1, best_rms, ckpt_dir / "latest.pth"
             )
 
-        # Validation (every 100 epochs for speed)
-        if (epoch + 1) % 100 == 0 and len(val_ds) > 0:
-            rms = evaluate_fold(model, val_ds, cfg, device)
-            logger.info("Fold %d | Epoch %d | RMSass=%.4f", fold_idx, epoch + 1, rms)
+        if (epoch + 1) % val_interval == 0 and len(val_ds) > 0:
+            rms = _evaluate_fold(model, val_ds, cfg, device)
+            logger.info(
+                "Fold %d | Epoch %d | RMS_matching=%.4f", fold_idx, epoch + 1, rms
+            )
             if rms > best_rms:
                 best_rms = rms
                 save_checkpoint(
@@ -159,14 +179,12 @@ def train_fold(
                 )
 
 
-def evaluate_fold(
+def _evaluate_fold(
     model: TreeRCNN,
     val_ds: NewforDataset,
     cfg,
     device: torch.device,
 ) -> float:
-    from utils.metrics import newfor_matching, compute_global_metrics
-
     model.eval()
     all_metrics = []
 
@@ -180,10 +198,9 @@ def evaluate_fold(
 
             out = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
             pred_boxes = out["boxes"].cpu().numpy()
-            scores = out["scores"].cpu().numpy()
+            pts_np = points.cpu().numpy()
 
-            # Extract tree positions: bottom centre (x, y) + max point height
-            detected = _extract_tree_positions(pred_boxes, points.cpu().numpy())
+            detected = extract_tree_positions(pred_boxes, pts_np)
             ref = gt_boxes.cpu().numpy()
             ref_xyz = np.column_stack([ref[:, 0], ref[:, 1], ref[:, 5]])
 
@@ -194,43 +211,18 @@ def evaluate_fold(
     return gm.rms_ass
 
 
-def _extract_tree_positions(boxes: np.ndarray, points: np.ndarray) -> np.ndarray:
-    """
-    Extract (x, y, height) from detections.
-    Height = highest point inside box; position = box bottom centre.
-    """
-    results = []
-    for box in boxes:
-        x, y, z_c, w, l, h = box
-        mask = (
-            (points[:, 0] >= x - w / 2)
-            & (points[:, 0] <= x + w / 2)
-            & (points[:, 1] >= y - l / 2)
-            & (points[:, 1] <= y + l / 2)
-            & (points[:, 2] >= 0)
-            & (points[:, 2] <= h)
-        )
-        inside = points[mask]
-        if len(inside) > 0:
-            actual_h = float(inside[:, 2].max())
-        else:
-            actual_h = float(h)
-        results.append([x, y, actual_h])
-    return np.array(results, dtype=np.float32) if results else np.zeros((0, 3))
-
-
 def main() -> None:
     import argparse
 
     parser = argparse.ArgumentParser(description="Train TreeRCNN")
     parser.add_argument("--config", default="configs/tree_rcnn.yaml")
-    parser.add_argument("--data_root", required=True, help="Path to NEWFOR dataset")
+    parser.add_argument("--data_root", required=True, help="Path to dataset root")
     parser.add_argument("--out_dir", default="outputs/")
     parser.add_argument(
         "--fold",
         type=int,
         default=None,
-        help="Single fold to train (0-indexed); default: all folds",
+        help="Single fold index to train (0-indexed); default: all folds",
     )
     args = parser.parse_args()
 

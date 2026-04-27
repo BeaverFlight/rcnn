@@ -7,10 +7,11 @@ within a search radius, then computing RMS rates.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass, field
-from typing import List
+from dataclasses import dataclass
 
 import numpy as np
+import torch
+from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
@@ -51,12 +52,51 @@ class PlotMetrics:
 
 @dataclass
 class GlobalMetrics:
-    rms_ass: float  # RMS matching rate
+    rms_ass: float
     rms_extr: float
     rms_com: float
     rms_om: float
     rms_h: float
     rms_v: float
+
+
+def extract_tree_positions(
+    boxes: np.ndarray,
+    points: np.ndarray,
+    max_points_per_box: int = 512,
+) -> np.ndarray:
+    """
+    Extract (x, y, height) from predicted 3D boxes.
+
+    Height = highest LiDAR point inside box.
+    Position = box bottom centre (x, y).
+
+    Args:
+        boxes:  (K, 6) predicted boxes [x, y, z_c, w, l, h]
+        points: (N, 3) point cloud [x, y, z]
+
+    Returns:
+        (K, 3) array [x, y, height], or zeros shape (0, 3) if no boxes.
+    """
+    results = []
+    for box in boxes:
+        x, y, z_c, w, l, h = box
+        mask = (
+            (points[:, 0] >= x - w / 2)
+            & (points[:, 0] <= x + w / 2)
+            & (points[:, 1] >= y - l / 2)
+            & (points[:, 1] <= y + l / 2)
+            & (points[:, 2] >= 0)
+            & (points[:, 2] <= h)
+        )
+        inside = points[mask]
+        actual_h = float(inside[:, 2].max()) if len(inside) > 0 else float(h)
+        results.append([x, y, actual_h])
+    return (
+        np.array(results, dtype=np.float32)
+        if results
+        else np.zeros((0, 3), dtype=np.float32)
+    )
 
 
 def newfor_matching(
@@ -69,21 +109,21 @@ def newfor_matching(
     Match detected trees to reference trees by nearest-neighbour.
 
     Args:
-        detected:  (Nd, 3+) [x, y, height, ...]
-        reference: (Nr, 3)  [x, y, height]
-        search_radius: maximum matching distance (m)
-        plot_id:   identifier for logging
+        detected:      (Nd, 3+) [x, y, height, ...]
+        reference:     (Nr, 3)  [x, y, height]
+        search_radius: maximum matching distance in meters
+        plot_id:       identifier for logging
 
     Returns:
         PlotMetrics for this plot
     """
     n_test = len(detected)
     n_ref = len(reference)
-    matched_det = set()
+    matched_det: set[int] = set()
     h_diffs: list[float] = []
     v_diffs: list[float] = []
 
-    for ref_i, ref_tree in enumerate(reference):
+    for ref_tree in reference:
         best_dist = search_radius + 1e-9
         best_det = -1
         for det_j, det_tree in enumerate(detected):
@@ -96,20 +136,19 @@ def newfor_matching(
         if best_det >= 0 and best_dist <= search_radius:
             matched_det.add(best_det)
             h_diffs.append(best_dist)
-            vdiff = abs(float(detected[best_det, 2]) - float(ref_tree[2]))
-            v_diffs.append(vdiff)
+            v_diffs.append(abs(float(detected[best_det, 2]) - float(ref_tree[2])))
 
     n_match = len(matched_det)
     h_mean = float(np.mean(h_diffs)) if h_diffs else 0.0
     v_mean = float(np.mean(v_diffs)) if v_diffs else 0.0
 
     logger.info(
-        "Plot %d: Nd=%d Nr=%d Nm=%d Rmr=%.2f%%",
+        "Plot %d: detected=%d reference=%d matched=%d recall=%.1f%%",
         plot_id,
         n_test,
         n_ref,
         n_match,
-        100 * n_match / max(n_ref, 1),
+        100.0 * n_match / max(n_ref, 1),
     )
     return PlotMetrics(plot_id, n_test, n_ref, n_match, h_mean, v_mean)
 
