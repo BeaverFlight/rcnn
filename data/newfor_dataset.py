@@ -20,7 +20,6 @@ from data.augmentation import augment
 
 logger = logging.getLogger(__name__)
 
-# Mapping plot ids → subdirectory names (adjust to actual dataset layout)
 PLOT_DIR_PATTERN = "plot_{:02d}"
 
 
@@ -34,7 +33,7 @@ class NewforDataset(Dataset):
             plot_01/
                 plot_01.las
                 dem.asc  (or dem.tif)
-                reference_trees.txt   # x y height per line
+                reference_trees.txt
             plot_02/
                 ...
     """
@@ -55,7 +54,6 @@ class NewforDataset(Dataset):
         self._plots: list[PlotData] = []
         self._load_all()
 
-    # ------------------------------------------------------------------
     def _load_all(self) -> None:
         for pid in self.plot_ids:
             pdir = self.root / PLOT_DIR_PATTERN.format(pid)
@@ -101,15 +99,29 @@ class NewforDataset(Dataset):
                 points, gt_boxes, local_maxima, self.cfg.training.augmentation
             )
 
+        # Пересчитываем plot_bounds из актуальных точек (после аугментации)
+        # ВАЖНО: возвращаем как список float, не как тензор,
+        # чтобы избежать проблем с batch-stacking в collate_fn
+        x_min = float(points[:, 0].min())
+        y_min = float(points[:, 1].min())
+        x_max = float(points[:, 0].max())
+        y_max = float(points[:, 1].max())
+        plot_bounds = [x_min, y_min, x_max, y_max]
+
+        logger.debug(
+            "plot %02d bounds: x=[%.1f, %.1f]  y=[%.1f, %.1f]",
+            plot.plot_id, x_min, x_max, y_min, y_max,
+        )
+
         # Subsample
         if len(points) > self.max_points:
             idx_sub = np.random.choice(len(points), self.max_points, replace=False)
             points = points[idx_sub]
 
         return {
-            "points": torch.from_numpy(points).float(),  # (N, 3)
-            "gt_boxes": torch.from_numpy(gt_boxes).float(),  # (M, 6)
-            "local_maxima": torch.from_numpy(local_maxima).float(),  # (K, 3)
-            "plot_bounds": torch.tensor(plot.plot_bounds).float(),
-            "plot_id": plot.plot_id,
+            "points":       torch.from_numpy(points).float(),       # (N, 3)
+            "gt_boxes":     torch.from_numpy(gt_boxes).float(),     # (M, 6)
+            "local_maxima": torch.from_numpy(local_maxima).float(), # (K, 3)
+            "plot_bounds":  plot_bounds,   # list[float] — не тензор!
+            "plot_id":      plot.plot_id,
         }
