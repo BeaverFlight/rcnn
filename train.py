@@ -1,13 +1,5 @@
 """
 TreeRCNN training script with 4-fold cross-validation.
-
-Fixes vs original:
-  - Оптимизатор заменён с Adagrad на Adam (lr=1e-3): Adagrad накапливал
-    квадраты градиентов → эффективный lr падал до ~1e-7 уже через сотни шагов.
-  - Добавлен gradient clipping (max_norm=1.0): предотвращает взрыв градиентов.
-  - Добавлена диагностика: логируем loss каждые log_interval батчей,
-    явно предупреждаем о NaN/Inf лоссе.
-  - learning_rate и weight_decay читаются из конфига (обратная совместимость).
 """
 
 from __future__ import annotations
@@ -114,7 +106,6 @@ def train_fold(
 
     model = TreeRCNN(cfg).to(device)
 
-    # Adam вместо Adagrad: не накапливает lr-decay, лучше сходится
     lr = cfg.training.get("learning_rate", 1e-3)
     wd = cfg.training.get("weight_decay", 1e-4)
     optimizer = torch.optim.Adam(
@@ -123,7 +114,6 @@ def train_fold(
         weight_decay=wd,
     )
 
-    # Косинусный lr-scheduler: плавно снижает lr к концу обучения
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer,
         T_max=cfg.training.epochs,
@@ -150,20 +140,27 @@ def train_fold(
         nan_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
-            points      = batch["points"]
-            gt_boxes    = batch["gt_boxes"]
+            points       = batch["points"]
+            gt_boxes     = batch["gt_boxes"]
             local_maxima = batch["local_maxima"]
-            plot_bounds = batch["plot_bounds"]
+            # plot_bounds — список [list[float]] после collate (batch_size=1)
+            plot_bounds  = batch["plot_bounds"]
 
-            if isinstance(points, list):       points      = points[0]
-            if isinstance(gt_boxes, list):     gt_boxes    = gt_boxes[0]
+            # Разворачиваем batch=1
+            if isinstance(points,       list): points       = points[0]
+            if isinstance(gt_boxes,     list): gt_boxes     = gt_boxes[0]
             if isinstance(local_maxima, list): local_maxima = local_maxima[0]
-            if isinstance(plot_bounds, list):  plot_bounds = plot_bounds[0]
+            # plot_bounds – всегда list после collate, берём [0]
+            if isinstance(plot_bounds, (list, tuple)):
+                plot_bounds = plot_bounds[0]
+            # Если по какой-то причине всё же тензор (1,4) — сплющиваем
+            if isinstance(plot_bounds, torch.Tensor):
+                plot_bounds = plot_bounds.squeeze().tolist()
 
-            points      = points.to(device)
-            gt_boxes    = gt_boxes.to(device)
+            points       = points.to(device)
+            gt_boxes     = gt_boxes.to(device)
             local_maxima = local_maxima.to(device)
-            plot_bounds = plot_bounds.to(device)
+            # plot_bounds — простой list[float], не нуждается в .to(device)
 
             optimizer.zero_grad()
             loss_dict = model(points, gt_boxes, local_maxima, plot_bounds, training=True)
@@ -172,14 +169,13 @@ def train_fold(
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 nan_batches += 1
                 logger.warning(
-                    "Epoch %d, batch %d: NaN/Inf loss — batch skipped (total skipped: %d)",
+                    "Epoch %d, batch %d: NaN/Inf loss — batch skipped (total: %d)",
                     epoch + 1, batch_idx, nan_batches,
                 )
                 optimizer.zero_grad()
                 continue
 
             total_loss.backward()
-            # Gradient clipping: предотвращает взрыв градиентов
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             optimizer.step()
             epoch_losses.append(total_loss.item())
@@ -229,11 +225,11 @@ def _evaluate_fold(
 
     with torch.no_grad():
         for sample in val_ds:
-            points      = sample["points"].to(device)
-            gt_boxes    = sample["gt_boxes"].to(device)
+            points       = sample["points"].to(device)
+            gt_boxes     = sample["gt_boxes"].to(device)
             local_maxima = sample["local_maxima"].to(device)
-            plot_bounds = sample["plot_bounds"].to(device)
-            plot_id     = sample["plot_id"]
+            plot_bounds  = sample["plot_bounds"]  # list[float]
+            plot_id      = sample["plot_id"]
 
             out = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
             pred_boxes = out["boxes"].cpu().numpy()
