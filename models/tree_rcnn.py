@@ -1,13 +1,5 @@
 """
 TreeRCNN: two-stage 3D tree detection network.
-
-Fixes:
-  - _subsample_points_batch: удалён Python-цикл внутри чанка. Теперь
-    возвращаем (counts, flat_indices) и разбиваем на CPU одним
-    torch.split — без Python-цикла по якорям.
-  - Исправлена ошибка 0-valid-anchors: z-фильтр теперь использует
-    anchor[5] (высоту якоря) вместо постоянного h из height_levels.
-  - Добавлен подробный progress-лог с временами на каждом этапе.
 """
 
 from __future__ import annotations
@@ -32,16 +24,12 @@ logger = logging.getLogger(__name__)
 
 _MAX_POINTS_PER_BOX = 512
 _MIN_POINTS_FOR_NET = 4
-# Максимальный размер чанка якорей для broadcast-маски.
-# (chunk * N_pts) float16 не должен превышать ~2 GB VRAM.
-# Для L4 (24 GB) можно 2048+, для 8 GB — 256.
 _ANCHOR_CHUNK = 1024
 
 
 def _subsample_points_in_box(
     points: Tensor, box: Tensor, n: int = _MAX_POINTS_PER_BOX
 ) -> Tensor:
-    """Return up to n points inside a single axis-aligned 3D box."""
     x, y, z_c, w, l, h = box.unbind()
     mask = (
         (points[:, 0] >= x - w / 2)
@@ -64,39 +52,25 @@ def _subsample_points_batch(
     n: int = _MAX_POINTS_PER_BOX,
     chunk: int = _ANCHOR_CHUNK,
 ) -> list[Tensor]:
-    """
-    Векторизованное вырезание точек для батча якорей.
-
-    Вместо Python-цикла `for anchor in anchors`:
-      1. Строим булеву маску (C, N) через broadcast за один вызов.
-      2. Подсчитываем counts[i] = число True для каждого якоря.
-      3. Извлекаем все точки одним nonzero, split по counts.
-
-    points : (N, 3)
-    anchors: (A, 6)  [cx, cy, cz, w, l, h]
-    returns: list of A tensors, each (n_i, 3), n_i <= n
-    """
     device = points.device
     A = anchors.shape[0]
     result: list[Tensor] = [None] * A  # type: ignore[list-item]
 
-    px = points[:, 0]  # (N,)
+    px = points[:, 0]
     py = points[:, 1]
     pz = points[:, 2]
 
     for start in range(0, A, chunk):
         end = min(start + chunk, A)
-        anc = anchors[start:end]  # (C, 6)
+        anc = anchors[start:end]
         C = end - start
 
-        cx = anc[:, 0].unsqueeze(1)  # (C, 1)
+        cx = anc[:, 0].unsqueeze(1)
         cy = anc[:, 1].unsqueeze(1)
         w  = anc[:, 3].unsqueeze(1)
         l  = anc[:, 4].unsqueeze(1)
-        # Используем h из самого якоря (col 5), не константу из height_levels
         h  = anc[:, 5].unsqueeze(1)
 
-        # mask: (C, N) — все якоря одновременно
         mask = (
             (px.unsqueeze(0) >= cx - w / 2)
             & (px.unsqueeze(0) <= cx + w / 2)
@@ -104,17 +78,12 @@ def _subsample_points_batch(
             & (py.unsqueeze(0) <= cy + l / 2)
             & (pz.unsqueeze(0) >= 0)
             & (pz.unsqueeze(0) <= h)
-        )  # (C, N) bool
+        )
 
-        # Кол-во точек на каждый якорь
-        counts = mask.sum(dim=1)  # (C,) int
-
-        # Индексы якоря (anchor_idx) и точек (point_idx) через nonzero
-        anchor_idx, point_idx = mask.nonzero(as_tuple=True)  # (M,), (M,)
-
-        # Разбиваем point_idx по якорям
-        counts_list = counts.tolist()  # CPU, быстро
-        groups = torch.split(point_idx, counts_list)  # tuple of C tensors
+        counts = mask.sum(dim=1)
+        anchor_idx, point_idx = mask.nonzero(as_tuple=True)
+        counts_list = counts.tolist()
+        groups = torch.split(point_idx, counts_list)
 
         for i, grp in enumerate(groups):
             if len(grp) == 0:
@@ -124,7 +93,6 @@ def _subsample_points_batch(
                 perm = torch.randperm(len(grp), device=device)[:n]
                 grp = grp[perm]
             pts = points[grp]
-            # Нормализация xy относительно центра якоря
             pts = pts.clone()
             pts[:, 0] -= anchors[start + i, 0]
             pts[:, 1] -= anchors[start + i, 1]
@@ -138,10 +106,6 @@ def _pad_windows_to_batch(
     device: torch.device,
     min_pts: int = _MIN_POINTS_FOR_NET,
 ) -> tuple[Tensor, list[int]]:
-    """
-    Паддируем список тензоров точек до max_n через repeat-padding.
-    Возвращает (batch: (B, max_n, 3), valid_indices).
-    """
     valid_idx = [i for i, p in enumerate(pts_list) if p.shape[0] >= min_pts]
     if not valid_idx:
         return torch.zeros(0, min_pts, 3, device=device), valid_idx
@@ -291,7 +255,24 @@ class TreeRCNN(nn.Module):
         t = time.perf_counter()
         logger.info("  stage1 anchors=%d pts=%d — batch sampling...", A, len(points))
 
-        # Векторизованное вырезание + нормализация внутри _subsample_points_batch
+        # --- ДИАГНОСТИКА: сравниваем диапазоны координат ---
+        with torch.no_grad():
+            px_min, px_max = points[:, 0].min().item(), points[:, 0].max().item()
+            py_min, py_max = points[:, 1].min().item(), points[:, 1].max().item()
+            pz_min, pz_max = points[:, 2].min().item(), points[:, 2].max().item()
+            ax_min, ax_max = anchors[:, 0].min().item(), anchors[:, 0].max().item()
+            ay_min, ay_max = anchors[:, 1].min().item(), anchors[:, 1].max().item()
+            ah_min, ah_max = anchors[:, 5].min().item(), anchors[:, 5].max().item()
+        logger.info(
+            "  PTS  x=[%.1f, %.1f]  y=[%.1f, %.1f]  z=[%.2f, %.2f]",
+            px_min, px_max, py_min, py_max, pz_min, pz_max,
+        )
+        logger.info(
+            "  ANCH x=[%.1f, %.1f]  y=[%.1f, %.1f]  h=[%.2f, %.2f]",
+            ax_min, ax_max, ay_min, ay_max, ah_min, ah_max,
+        )
+        # --- конец диагностики ---
+
         pts_list = _subsample_points_batch(points, anchors)
         logger.info("  sampling done %.2fs", time.perf_counter() - t)
 
