@@ -84,6 +84,14 @@ class TreeRCNN(nn.Module):
         Returns:
             dict with losses (training) or {'boxes': Tensor, 'scores': Tensor}
         """
+        # Убираем batch-измерение: (1,N,3)->(N,3), (1,M,6)->(M,6), (1,K,3)->(K,3)
+        while points.dim() > 2:
+            points = points.squeeze(0)
+        while gt_boxes.dim() > 2:
+            gt_boxes = gt_boxes.squeeze(0)
+        while local_maxima.dim() > 2:
+            local_maxima = local_maxima.squeeze(0)
+
         device = points.device
         pb = (
             tuple(plot_bounds.tolist())
