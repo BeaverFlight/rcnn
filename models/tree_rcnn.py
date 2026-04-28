@@ -26,6 +26,11 @@ _MAX_POINTS_PER_BOX = 512
 _MIN_POINTS_FOR_NET = 4
 _ANCHOR_CHUNK = 1024
 
+# Размер мини-батча при прогоне ProposalHead.
+# 64 якоря × 512 pts × 3 coords = ~400KB → 64 батча по 64 = 4MB пиковой памяти.
+# Увеличь до 256 если видеопамяти хватает; уменьши до 32 если снова OOM.
+_STAGE1_INFER_BATCH = 64
+
 
 def _subsample_points_in_box(
     points: Tensor, box: Tensor, n: int = _MAX_POINTS_PER_BOX
@@ -63,7 +68,6 @@ def _subsample_points_batch(
     for start in range(0, A, chunk):
         end = min(start + chunk, A)
         anc = anchors[start:end]
-        C = end - start
 
         cx = anc[:, 0].unsqueeze(1)
         cy = anc[:, 1].unsqueeze(1)
@@ -81,7 +85,7 @@ def _subsample_points_batch(
         )
 
         counts = mask.sum(dim=1)
-        anchor_idx, point_idx = mask.nonzero(as_tuple=True)
+        _, point_idx = mask.nonzero(as_tuple=True)
         counts_list = counts.tolist()
         groups = torch.split(point_idx, counts_list)
 
@@ -92,8 +96,7 @@ def _subsample_points_batch(
             if len(grp) > n:
                 perm = torch.randperm(len(grp), device=device)[:n]
                 grp = grp[perm]
-            pts = points[grp]
-            pts = pts.clone()
+            pts = points[grp].clone()
             pts[:, 0] -= anchors[start + i, 0]
             pts[:, 1] -= anchors[start + i, 1]
             result[start + i] = pts
@@ -106,6 +109,7 @@ def _pad_windows_to_batch(
     device: torch.device,
     min_pts: int = _MIN_POINTS_FOR_NET,
 ) -> tuple[Tensor, list[int]]:
+    """Паддинг списка облаков точек в единый тензор (B, max_n, 3)."""
     valid_idx = [i for i, p in enumerate(pts_list) if p.shape[0] >= min_pts]
     if not valid_idx:
         return torch.zeros(0, min_pts, 3, device=device), valid_idx
@@ -236,7 +240,9 @@ class TreeRCNN(nn.Module):
         sampled_anchors = all_anchors[sampled]
         logger.info("S1 loss: %d sampled anchors", len(sampled_anchors))
 
-        cls_logits, reg_deltas = self._run_stage1_on_anchors(points, sampled_anchors)
+        cls_logits, reg_deltas = self._run_stage1_on_anchors(
+            points, sampled_anchors, infer_mode=False
+        )
         sampled_labels = labels[sampled].float()
         cls_loss = sigmoid_focal_loss(cls_logits.squeeze(-1), sampled_labels)
 
@@ -249,13 +255,24 @@ class TreeRCNN(nn.Module):
         total = cls_loss + self.lambda_reg * reg_loss
         return {"loss_stage1_cls": cls_loss, "loss_stage1_reg": reg_loss, "total_loss_stage1": total}
 
-    def _run_stage1_on_anchors(self, points, anchors):
+    def _run_stage1_on_anchors(
+        self,
+        points: Tensor,
+        anchors: Tensor,
+        infer_mode: bool = True,
+    ) -> tuple[Tensor, Tensor]:
+        """
+        Прогоняет ProposalHead по якорям мини-батчами.
+
+        infer_mode=True  → torch.no_grad() + последовательные чанки (inference)
+        infer_mode=False → градиент сохраняется (training loss)
+        """
         device = points.device
         A = len(anchors)
         t = time.perf_counter()
         logger.info("  stage1 anchors=%d pts=%d — batch sampling...", A, len(points))
 
-        # --- ДИАГНОСТИКА: сравниваем диапазоны координат ---
+        # --- диагностика координат ---
         with torch.no_grad():
             px_min, px_max = points[:, 0].min().item(), points[:, 0].max().item()
             py_min, py_max = points[:, 1].min().item(), points[:, 1].max().item()
@@ -271,55 +288,69 @@ class TreeRCNN(nn.Module):
             "  ANCH x=[%.1f, %.1f]  y=[%.1f, %.1f]  h=[%.2f, %.2f]",
             ax_min, ax_max, ay_min, ay_max, ah_min, ah_max,
         )
-        # --- конец диагностики ---
 
+        # --- сэмплирование точек в якоря ---
         pts_list = _subsample_points_batch(points, anchors)
         logger.info("  sampling done %.2fs", time.perf_counter() - t)
 
-        batch, valid_idx = _pad_windows_to_batch(pts_list, device)
+        valid_idx = [i for i, p in enumerate(pts_list) if p.shape[0] >= _MIN_POINTS_FOR_NET]
         logger.info("  valid=%d/%d → stage1 fwd...", len(valid_idx), A)
 
         cls_out = torch.zeros(A, 1, device=device)
         reg_out = torch.zeros(A, 4, device=device)
-        if len(valid_idx) == 0:
+
+        if not valid_idx:
             logger.warning("  0 valid anchors (all < %d pts)", _MIN_POINTS_FOR_NET)
             return cls_out, reg_out
 
+        valid_pts = [pts_list[i] for i in valid_idx]
+        V = len(valid_idx)
+        mb = _STAGE1_INFER_BATCH
         t2 = time.perf_counter()
-        c, r = self.stage1(batch)
-        logger.info("  stage1 fwd done %.2fs", time.perf_counter() - t2)
 
-        for k, orig_i in enumerate(valid_idx):
-            cls_out[orig_i] = c[k]
-            reg_out[orig_i] = r[k]
+        ctx = torch.no_grad() if infer_mode else torch.enable_grad()
+        with ctx:  # type: ignore[attr-defined]
+            for start in range(0, V, mb):
+                end = min(start + mb, V)
+                chunk_pts = valid_pts[start:end]
+                batch, _ = _pad_windows_to_batch(chunk_pts, device)
+                # batch: (mb, max_n, 3)  — max_n меняется от чанка к чанку
+                c, r = self.stage1(batch)
+                for k, orig_i in enumerate(valid_idx[start:end]):
+                    cls_out[orig_i] = c[k].detach() if infer_mode else c[k]
+                    reg_out[orig_i] = r[k].detach() if infer_mode else r[k]
+
+        logger.info(
+            "  stage1 fwd done %.2fs (%d mini-batches of %d)",
+            time.perf_counter() - t2, (V + mb - 1) // mb, mb,
+        )
         return cls_out, reg_out
 
     def _stage1_proposals(self, points, ad, al_list, device):
         cfg_nms = self.cfg.stage1_nms
-        with torch.no_grad():
-            if len(ad) > 0:
-                logger.info("S1 proposals: ad=%d", len(ad))
-                cls_ad, reg_ad = self._run_stage1_on_anchors(points, ad)
-                scores_ad = torch.sigmoid(cls_ad.squeeze(-1))
-                boxes_ad  = decode_boxes(reg_ad, ad)
-                keep_ad   = nms3d(boxes_ad, scores_ad, cfg_nms.ad_iouv_threshold, cfg_nms.ad_max_proposals)
-                props_ad  = boxes_ad[keep_ad]
-                logger.info("  ad after NMS: %d", len(props_ad))
-            else:
-                props_ad = torch.zeros(0, 6, device=device)
 
-            parts = []
-            for i, al in enumerate(al_list):
-                if len(al) == 0:
-                    continue
-                cls_al, reg_al = self._run_stage1_on_anchors(points, al)
-                scores_al = torch.sigmoid(cls_al.squeeze(-1))
-                boxes_al  = decode_boxes(reg_al, al)
-                keep_al   = nms3d(boxes_al, scores_al, cfg_nms.al_iouv_threshold, cfg_nms.al_max_proposals_per_maxima)
-                parts.append(boxes_al[keep_al])
+        if len(ad) > 0:
+            logger.info("S1 proposals: ad=%d", len(ad))
+            cls_ad, reg_ad = self._run_stage1_on_anchors(points, ad, infer_mode=True)
+            scores_ad = torch.sigmoid(cls_ad.squeeze(-1))
+            boxes_ad  = decode_boxes(reg_ad, ad)
+            keep_ad   = nms3d(boxes_ad, scores_ad, cfg_nms.ad_iouv_threshold, cfg_nms.ad_max_proposals)
+            props_ad  = boxes_ad[keep_ad]
+            logger.info("  ad after NMS: %d", len(props_ad))
+        else:
+            props_ad = torch.zeros(0, 6, device=device)
 
-            props_al = torch.cat(parts, dim=0) if parts else torch.zeros(0, 6, device=device)
+        parts = []
+        for i, al in enumerate(al_list):
+            if len(al) == 0:
+                continue
+            cls_al, reg_al = self._run_stage1_on_anchors(points, al, infer_mode=True)
+            scores_al = torch.sigmoid(cls_al.squeeze(-1))
+            boxes_al  = decode_boxes(reg_al, al)
+            keep_al   = nms3d(boxes_al, scores_al, cfg_nms.al_iouv_threshold, cfg_nms.al_max_proposals_per_maxima)
+            parts.append(boxes_al[keep_al])
 
+        props_al = torch.cat(parts, dim=0) if parts else torch.zeros(0, 6, device=device)
         proposals = torch.cat([props_ad, props_al], dim=0)
         logger.info("S1 total proposals: %d", len(proposals))
         return proposals
