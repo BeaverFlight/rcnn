@@ -155,18 +155,13 @@ class TreeRCNN(nn.Module):
             else plot_bounds
         )
 
-        logger.info(
-            "Forward: %d pts | %d GT | %d maxima",
-            len(points), len(gt_boxes), len(local_maxima),
-        )
-
         # ---- Anchor generation ----------------------------------------
         t1 = time.perf_counter()
         ad, al_list = self.anchor_gen.generate_all(pb, local_maxima.cpu().numpy())
         ad = ad.to(device)
         al_flat = [a.to(device) for a in al_list]
         n_al = sum(len(a) for a in al_flat)
-        logger.info(
+        logger.debug(
             "Anchors: ad=%d  al=%d  (%.2fs)",
             len(ad), n_al, time.perf_counter() - t1,
         )
@@ -175,13 +170,13 @@ class TreeRCNN(nn.Module):
         if training:
             t2 = time.perf_counter()
             loss_s1 = self._stage1_loss(points, ad, al_flat, gt_boxes)
-            logger.info("S1 loss done (%.2fs)", time.perf_counter() - t2)
+            logger.debug("S1 loss done (%.2fs)", time.perf_counter() - t2)
         else:
             loss_s1 = {}
 
         t3 = time.perf_counter()
         proposals = self._stage1_proposals(points, ad, al_flat, device)
-        logger.info("S1 proposals done: %d  (%.2fs)", len(proposals), time.perf_counter() - t3)
+        logger.debug("S1 proposals done: %d  (%.2fs)", len(proposals), time.perf_counter() - t3)
 
         if len(proposals) == 0:
             zero = torch.tensor(0.0, device=device)
@@ -199,7 +194,7 @@ class TreeRCNN(nn.Module):
         if training:
             t4 = time.perf_counter()
             loss_s2 = self._stage2_loss(points, proposals, gt_boxes)
-            logger.info("S2 loss done (%.2fs)", time.perf_counter() - t4)
+            logger.debug("S2 loss done (%.2fs)", time.perf_counter() - t4)
 
             total = (
                 loss_s1.get("total_loss_stage1", torch.tensor(0.0, device=device))
@@ -209,14 +204,14 @@ class TreeRCNN(nn.Module):
                 logger.warning("NaN/Inf in total_loss — skipping batch")
                 total = torch.tensor(0.0, device=device, requires_grad=True)
 
-            logger.info(
+            logger.debug(
                 "Forward done %.2fs | loss=%.4f",
                 time.perf_counter() - t0, total.item(),
             )
             return {**loss_s1, **loss_s2, "total_loss": total}
 
         final_boxes, final_scores = self._stage2_inference(points, proposals)
-        logger.info("Inference done (%.2fs)", time.perf_counter() - t0)
+        logger.debug("Inference done (%.2fs)", time.perf_counter() - t0)
         return {"boxes": final_boxes, "scores": final_scores}
 
     # ------------------------------------------------------------------
@@ -233,7 +228,7 @@ class TreeRCNN(nn.Module):
             n_neg=self.cfg.training.n_negative,
         )
         sampled_anchors = all_anchors[sampled]
-        logger.info("S1 loss: %d sampled anchors", len(sampled_anchors))
+        logger.debug("S1 loss: %d sampled anchors", len(sampled_anchors))
 
         cls_logits, reg_deltas = self._run_stage1_on_anchors(
             points, sampled_anchors, infer_mode=False, tag="s1_loss"
@@ -257,10 +252,6 @@ class TreeRCNN(nn.Module):
         infer_mode: bool = True,
         tag: str = "",
     ) -> tuple[Tensor, Tensor]:
-        """
-        Прогоняет ProposalHead по якорям мини-батчами.
-        Логирует только сводную строку (sampling + fwd).
-        """
         device = points.device
         A = len(anchors)
         t = time.perf_counter()
@@ -293,7 +284,7 @@ class TreeRCNN(nn.Module):
                     reg_out[orig_i] = r[k].detach() if infer_mode else r[k]
 
         n_mb = (V + mb - 1) // mb
-        logger.info(
+        logger.debug(
             "  [%s] anchors=%d valid=%d/%d | sample=%.2fs fwd=%.2fs (%d mb)",
             tag, A, V, A,
             t_sample, time.perf_counter() - t_fwd, n_mb,
@@ -311,14 +302,13 @@ class TreeRCNN(nn.Module):
             boxes_ad  = decode_boxes(reg_ad, ad)
             keep_ad   = nms3d(boxes_ad, scores_ad, cfg_nms.ad_iouv_threshold, cfg_nms.ad_max_proposals)
             props_ad  = boxes_ad[keep_ad]
-            logger.info("  ad NMS: %d → %d", len(ad), len(props_ad))
+            logger.debug("  ad NMS: %d → %d", len(ad), len(props_ad))
         else:
             props_ad = torch.zeros(0, 6, device=device)
 
-        # --- al proposals: объединяем все al-якоря в один вызов ---
+        # --- al proposals ---
         if al_list:
-            al_all = torch.cat(al_list, dim=0)  # (N_al, 6)
-            # запоминаем границы каждого кластера для per-maxima NMS
+            al_all = torch.cat(al_list, dim=0)
             sizes = [len(a) for a in al_list]
 
             cls_al_all, reg_al_all = self._run_stage1_on_anchors(
@@ -342,12 +332,12 @@ class TreeRCNN(nn.Module):
                 offset += sz
 
             props_al = torch.cat(parts, dim=0) if parts else torch.zeros(0, 6, device=device)
-            logger.info("  al NMS: %d → %d", len(al_all), len(props_al))
+            logger.debug("  al NMS: %d → %d", len(al_all), len(props_al))
         else:
             props_al = torch.zeros(0, 6, device=device)
 
         proposals = torch.cat([props_ad, props_al], dim=0)
-        logger.info(
+        logger.debug(
             "  proposals total: %d  (%.2fs)",
             len(proposals), time.perf_counter() - t0,
         )
@@ -364,7 +354,7 @@ class TreeRCNN(nn.Module):
             n_neg=self.cfg.training.n_negative,
         )
         sampled_props = proposals[sampled]
-        logger.info("S2 loss: %d sampled proposals", len(sampled_props))
+        logger.debug("S2 loss: %d sampled proposals", len(sampled_props))
         pts_list = [_subsample_points_in_box(points, p) for p in sampled_props]
         cls_logits, reg_deltas = self.stage2(pts_list, sampled_props)
 
