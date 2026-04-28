@@ -1,0 +1,92 @@
+anchors:
+  boundary_extension_ratio: 0.2
+  height_levels:
+  - 4
+  - 8
+  - 16
+  - 26
+  - 36
+  si_ratio: 0.5
+  sw_stride_ratio: 0.5
+cross_validation:
+  folds:
+  - - 1
+    - 2
+    - 3
+  - - 4
+    - 5
+    - 6
+    - 7
+  - - 8
+    - 9
+    - 10
+  n_folds: 3
+crown_regression:
+  intercept: 1.1048
+  slope: 0.0512
+label_assignment:
+  positive_ioub_overlap: 0.65
+  positive_iouh_overlap: 0.7
+  positive_iouv_overlap: 0.4
+pointnet2:
+  npoints_per_window: 512
+  sa_layers:
+  - mlp:
+    - 3
+    - 32
+    - 32
+    - 64
+    npoint: 64
+    nsample: 32
+    radius: 0.5
+  - mlp:
+    - 67
+    - 64
+    - 128
+    npoint: 32
+    nsample: 32
+    radius: 1.0
+  - mlp:
+    - 131
+    - 256
+    - 512
+    npoint: null
+    nsample: null
+    radius: null
+preprocessing:
+  chm_resolution: 0.5
+  closing_window: 3
+  local_maxima_min_height: 5.0
+  local_maxima_window: 3
+  min_height: 0.5
+seed: 42
+stage1_nms:
+  ad_iouv_threshold: 0.6
+  ad_max_proposals: 2500
+  ad_score_threshold: 0.3
+  al_iouv_threshold: 0.6
+  al_max_proposals_per_maxima: 5
+stage2_nms:
+  iouv_threshold: 0.4
+  score_threshold: 0.4
+training:
+  augmentation:
+    random_rotation: true
+    rotation_range: 360
+    random_translation: true
+    translation_range: 0.5
+  batch_size: 1
+  checkpoint_interval: 100
+  epochs: 5000
+  lambda_reg: 1.0
+  learning_rate: 0.001
+  log_interval: 3
+  max_grad_norm: 1.0
+  max_points: 150000
+  n_negative: 512
+  n_positive: 512
+  num_workers: 4
+  optimizer: adagrad
+  stage1_infer_batch: 128
+  val_interval: 100
+  weight_decay: 0.0001
