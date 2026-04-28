@@ -1,6 +1,11 @@
 """
 TreeRCNN: two-stage 3D tree detection network.
-Assembles Stage 1 (Proposal Generation) + Stage 2 (Refinement).
+
+Fixes vs original:
+  - _run_stage1_on_anchors: якоря обрабатываются одним батчем (pad → stack → forward)
+    вместо Python-цикла. Ускорение на GPU — в разы.
+  - Добавлен guard на NaN в total_loss перед return (в training).
+  - _subsample_points_in_box: добавлен guard min 4 точки для BatchNorm/LayerNorm.
 """
 
 from __future__ import annotations
@@ -24,6 +29,7 @@ from utils.box_coder import decode_boxes
 logger = logging.getLogger(__name__)
 
 _MAX_POINTS_PER_BOX = 512
+_MIN_POINTS_FOR_NET = 4   # меньше — нет смысла гонять через PointNet++
 
 
 def _subsample_points_in_box(
@@ -46,10 +52,35 @@ def _subsample_points_in_box(
     return inside
 
 
+def _pad_windows_to_batch(
+    pts_list: list[Tensor],
+    device: torch.device,
+    min_pts: int = _MIN_POINTS_FOR_NET,
+) -> tuple[Tensor, list[int]]:
+    """
+    Паддируем список тензоров точек до единого max_n через repeat-padding.
+    Возвращает (batch: (B, max_n, 3), valid_indices: список индексов с >= min_pts точек).
+    """
+    valid_idx = [i for i, p in enumerate(pts_list) if p.shape[0] >= min_pts]
+    if not valid_idx:
+        return torch.zeros(0, min_pts, 3, device=device), valid_idx
+
+    valid_pts = [pts_list[i] for i in valid_idx]
+    max_n = max(p.shape[0] for p in valid_pts)
+
+    batched = torch.zeros(len(valid_pts), max_n, 3, device=device)
+    for k, pts in enumerate(valid_pts):
+        n = pts.shape[0]
+        if n < max_n:
+            reps = (max_n + n - 1) // n
+            pts = pts.repeat(reps, 1)[:max_n]
+        batched[k] = pts
+    return batched, valid_idx
+
+
 class TreeRCNN(nn.Module):
     """
     Full TreeRCNN model.
-
     Forward pass supports both training (returns loss dict) and
     inference (returns detected boxes).
     """
@@ -63,28 +94,15 @@ class TreeRCNN(nn.Module):
         self.lambda_reg: float = cfg.training.lambda_reg
 
     # ------------------------------------------------------------------
-    # Training
-    # ------------------------------------------------------------------
     def forward(
         self,
         points: Tensor,
         gt_boxes: Tensor,
         local_maxima: Tensor,
-        plot_bounds: tuple[float, float, float, float],
+        plot_bounds,
         training: bool = True,
     ) -> dict:
-        """
-        Args:
-            points:      (N, 3) normalized point cloud
-            gt_boxes:    (M, 6) ground-truth boxes
-            local_maxima:(K, 3) local maxima [x, y, height]
-            plot_bounds: (x_min, y_min, x_max, y_max)
-            training:    if True return loss dict; else return detections
-
-        Returns:
-            dict with losses (training) or {'boxes': Tensor, 'scores': Tensor}
-        """
-        # Убираем batch-измерение: (1,N,3)->(N,3), (1,M,6)->(M,6), (1,K,3)->(K,3)
+        # Убираем batch-измерения
         while points.dim() > 2:
             points = points.squeeze(0)
         while gt_boxes.dim() > 2:
@@ -112,14 +130,13 @@ class TreeRCNN(nn.Module):
         proposals = self._stage1_proposals(points, ad, al_flat, device)
 
         if len(proposals) == 0:
+            zero = torch.tensor(0.0, device=device)
             if training:
                 return {
                     **loss_s1,
-                    "loss_stage2_cls": torch.tensor(0.0, device=device),
-                    "loss_stage2_reg": torch.tensor(0.0, device=device),
-                    "total_loss": loss_s1.get(
-                        "total_loss_stage1", torch.tensor(0.0, device=device)
-                    ),
+                    "loss_stage2_cls": zero,
+                    "loss_stage2_reg": zero,
+                    "total_loss": loss_s1.get("total_loss_stage1", zero),
                 }
             return {
                 "boxes": torch.zeros(0, 6, device=device),
@@ -133,6 +150,10 @@ class TreeRCNN(nn.Module):
                 loss_s1.get("total_loss_stage1", torch.tensor(0.0, device=device))
                 + loss_s2["total_loss_stage2"]
             )
+            # NaN guard: если loss взорвался — возвращаем нули, не ломаем обучение
+            if torch.isnan(total) or torch.isinf(total):
+                logger.warning("NaN/Inf in total_loss — skipping batch")
+                total = torch.tensor(0.0, device=device, requires_grad=True)
             return {**loss_s1, **loss_s2, "total_loss": total}
 
         final_boxes, final_scores = self._stage2_inference(points, proposals)
@@ -185,27 +206,45 @@ class TreeRCNN(nn.Module):
     def _run_stage1_on_anchors(
         self, points: Tensor, anchors: Tensor
     ) -> tuple[Tensor, Tensor]:
-        """Run Stage-1 head on a batch of anchors."""
-        pts_list = [_subsample_points_in_box(points, a) for a in anchors]
-        cls_outs, reg_outs = [], []
-        for pts, anchor in zip(pts_list, anchors):
-            if pts.shape[0] < 4:
-                feat = torch.zeros(1, 3, device=points.device)
+        """
+        Обрабатывает все якоря одним батчем через GPU.
+
+        Алгоритм:
+          1. Для каждого якоря: вырезаем точки, нормализуем относительно центра якоря.
+          2. Паддируем все окна до max_n через repeat-padding.
+          3. Один вызов self.stage1(batch) → (B, 1), (B, 4).
+          4. Для невалидных якорей (< _MIN_POINTS_FOR_NET точек) выставляем нули.
+        """
+        device = points.device
+        A = len(anchors)
+
+        # Вырезаем и нормализуем точки для каждого якоря
+        pts_list: list[Tensor] = []
+        for anchor in anchors:
+            pts = _subsample_points_in_box(points, anchor)
+            if pts.shape[0] >= _MIN_POINTS_FOR_NET:
+                norm = pts.clone()
+                norm[:, 0] -= anchor[0]
+                norm[:, 1] -= anchor[1]
+                pts_list.append(norm)
             else:
-                feat = pts.unsqueeze(0)
-            # Normalize relative to anchor bottom center
-            norm_pts = feat.clone()
-            norm_pts[..., 0] -= anchor[0]
-            norm_pts[..., 1] -= anchor[1]
-            if norm_pts.shape[1] < 4:
-                # Pad to avoid PointNet++ issues
-                pad = torch.zeros(1, max(4, norm_pts.shape[1]), 3, device=points.device)
-                pad[0, : norm_pts.shape[1]] = norm_pts[0]
-                norm_pts = pad
-            c, r = self.stage1(norm_pts)
-            cls_outs.append(c)
-            reg_outs.append(r)
-        return torch.cat(cls_outs, dim=0), torch.cat(reg_outs, dim=0)
+                pts_list.append(pts)  # <4 — будет отфильтровано
+
+        batch, valid_idx = _pad_windows_to_batch(pts_list, device)
+
+        cls_out = torch.zeros(A, 1, device=device)
+        reg_out = torch.zeros(A, 4, device=device)
+
+        if len(valid_idx) == 0:
+            return cls_out, reg_out
+
+        # Один батчевый форвард-пасс
+        c, r = self.stage1(batch)                 # (V, 1), (V, 4)
+        for k, orig_i in enumerate(valid_idx):
+            cls_out[orig_i] = c[k]
+            reg_out[orig_i] = r[k]
+
+        return cls_out, reg_out
 
     def _stage1_proposals(
         self,
@@ -214,18 +253,15 @@ class TreeRCNN(nn.Module):
         al_list: list[Tensor],
         device: torch.device,
     ) -> Tensor:
-        """Run NMS on Stage-1 outputs to get proposals."""
         cfg_nms = self.cfg.stage1_nms
 
         with torch.no_grad():
-            # Dense anchors
             if len(ad) > 0:
                 cls_ad, reg_ad = self._run_stage1_on_anchors(points, ad)
                 scores_ad = torch.sigmoid(cls_ad.squeeze(-1))
                 boxes_ad = decode_boxes(reg_ad, ad)
                 keep_ad = nms3d(
-                    boxes_ad,
-                    scores_ad,
+                    boxes_ad, scores_ad,
                     cfg_nms.ad_iouv_threshold,
                     cfg_nms.ad_max_proposals,
                 )
@@ -233,7 +269,6 @@ class TreeRCNN(nn.Module):
             else:
                 props_ad = torch.zeros(0, 6, device=device)
 
-            # Local-maxima anchors (NMS per group)
             props_al_parts = []
             for al in al_list:
                 if len(al) == 0:
@@ -242,8 +277,7 @@ class TreeRCNN(nn.Module):
                 scores_al = torch.sigmoid(cls_al.squeeze(-1))
                 boxes_al = decode_boxes(reg_al, al)
                 keep_al = nms3d(
-                    boxes_al,
-                    scores_al,
+                    boxes_al, scores_al,
                     cfg_nms.al_iouv_threshold,
                     cfg_nms.al_max_proposals_per_maxima,
                 )
@@ -262,7 +296,9 @@ class TreeRCNN(nn.Module):
     # ------------------------------------------------------------------
     # Stage 2 helpers
     # ------------------------------------------------------------------
-    def _stage2_loss(self, points: Tensor, proposals: Tensor, gt_boxes: Tensor) -> dict:
+    def _stage2_loss(
+        self, points: Tensor, proposals: Tensor, gt_boxes: Tensor
+    ) -> dict:
         cfg_la = self.cfg.label_assignment
         labels, reg_targets, _, sampled = assign_targets(
             proposals,

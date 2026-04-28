@@ -1,5 +1,10 @@
 """
 Stage 2: Multi-position feature extraction for proposal refinement.
+
+Fixes vs original:
+  - Добавлен forward_batch(xyz_batch, proposals_batch) для обработки
+    нескольких proposals одним GPU-вызовом вместо Python-цикла.
+  - forward() теперь вызывает forward_batch для единственного proposal.
 """
 
 from __future__ import annotations
@@ -11,20 +16,12 @@ from torch import Tensor
 from models.backbone.pointnet2_modules import PointNetSetAbstraction
 
 
-def normalize_to_center(points: Tensor, cx: float, cy: float) -> Tensor:
-    """Translate points so that (cx, cy, 0) is the new origin."""
-    pts = points.clone()
-    pts[:, 0] -= cx
-    pts[:, 1] -= cy
-    return pts
-
-
 class MultiPositionExtractor(nn.Module):
     """
-    Extract multi-position features for a single proposal.
+    Extract multi-position features for proposals.
 
-    Runs PointNet++ on centre-normalized coordinates;
-    the 4 offset normalizations are appended as additional input features.
+    Запускает PointNet++ на центро-нормализованных координатах;
+    4 смещённые нормализации добавляются как дополнительные признаки.
     """
 
     def __init__(self, cfg) -> None:
@@ -35,7 +32,7 @@ class MultiPositionExtractor(nn.Module):
         sa2_mlp = list(pn2.sa_layers[2].mlp)
 
         # Input: 3 (centre coords) + 12 (4×3 offset coords) = 15
-        in_ch = sa0_mlp[0] + 12  # original in_ch + offset features
+        in_ch = sa0_mlp[0] + 12
 
         self.sa1 = PointNetSetAbstraction(
             npoint=pn2.sa_layers[0].npoint,
@@ -60,6 +57,55 @@ class MultiPositionExtractor(nn.Module):
         )
         self.out_dim = sa2_mlp[-1]
 
+    # ------------------------------------------------------------------
+    # Batched interface (основной путь)
+    # ------------------------------------------------------------------
+    def forward_batch(self, xyz_batch: Tensor, proposals: Tensor) -> Tensor:
+        """
+        Обрабатывает B proposals одним GPU-вызовом.
+
+        Args:
+            xyz_batch: (B, N, 3) — точки внутри каждого proposal (world coords),
+                       одинаковое N (добейтесь паддингом перед вызовом).
+            proposals: (B, 6)   — [x, y, z_c, w, l, h]
+
+        Returns:
+            feats: (B, feat_dim)
+        """
+        B, N, _ = xyz_batch.shape
+        x  = proposals[:, 0]  # (B,)
+        y  = proposals[:, 1]
+        w  = proposals[:, 3]
+
+        # Центро-нормализация: (B, N, 3)
+        centre_pts = xyz_batch.clone()
+        centre_pts[:, :, 0] -= x.unsqueeze(1)
+        centre_pts[:, :, 1] -= y.unsqueeze(1)
+        xyz_norm = centre_pts  # (B, N, 3)
+
+        # 4 смещённые нормализации → (B, N, 12)
+        offsets_xy = [
+            torch.stack([ x + w / 2,  y         ], dim=-1),  # (B, 2)
+            torch.stack([ x - w / 2,  y         ], dim=-1),
+            torch.stack([ x,          y + w / 2 ], dim=-1),
+            torch.stack([ x,          y - w / 2 ], dim=-1),
+        ]
+        offset_parts = []
+        for oxy in offsets_xy:
+            op = xyz_batch.clone()
+            op[:, :, 0] -= oxy[:, 0:1]
+            op[:, :, 1] -= oxy[:, 1:2]
+            offset_parts.append(op)
+        offset_feat = torch.cat(offset_parts, dim=-1)  # (B, N, 12)
+
+        xyz1, f1 = self.sa1(xyz_norm, offset_feat)    # (B, S1, 64)
+        xyz2, f2 = self.sa2(xyz1, f1)                 # (B, S2, 128)
+        _, f3    = self.sa3(xyz2, f2)                 # (B, 1, 512)
+        return f3.squeeze(1)                           # (B, feat_dim)
+
+    # ------------------------------------------------------------------
+    # Single-proposal interface (используется снаружи если нужно)
+    # ------------------------------------------------------------------
     def forward(self, points: Tensor, proposal: Tensor) -> Tensor:
         """
         Args:
@@ -69,35 +115,7 @@ class MultiPositionExtractor(nn.Module):
         Returns:
             feature: (feat_dim,)
         """
-        x, y, _, w, _, _ = proposal.unbind()
-        offsets = [
-            (x + w / 2, y),
-            (x - w / 2, y),
-            (x, y + w / 2),
-            (x, y - w / 2),
-        ]
-
-        # Centre-normalized coords (B=1 for PointNet++)
-        centre_pts = points.clone()
-        centre_pts[:, 0] -= x
-        centre_pts[:, 1] -= y
-        xyz = centre_pts.unsqueeze(0)  # (1, N, 3)
-
-        # Offset normalizations concatenated as features
-        offset_parts = []
-        for ox, oy in offsets:
-            op = points.clone()
-            op[:, 0] -= ox
-            op[:, 1] -= oy
-            offset_parts.append(op)
-        offset_feat = torch.cat(offset_parts, dim=-1)  # (N, 12)
-        feats = offset_feat.unsqueeze(0)  # (1, N, 12)
-
-        # SA layers treat offset_feat as point features at first SA layer
-        # We inject feats by combining xyz and feats at input of sa1
-        combined_input = torch.cat([xyz, feats], dim=-1)  # (1, N, 15)
-        # Reshape for PointNetSetAbstraction: pass xyz separately
-        xyz1, f1 = self.sa1(xyz, feats)
-        xyz2, f2 = self.sa2(xyz1, f1)
-        _, f3 = self.sa3(xyz2, f2)
-        return f3.squeeze(0).squeeze(0)  # (feat_dim,)
+        return self.forward_batch(
+            points.unsqueeze(0),
+            proposal.unsqueeze(0),
+        ).squeeze(0)

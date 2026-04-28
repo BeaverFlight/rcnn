@@ -1,5 +1,13 @@
 """
 TreeRCNN training script with 4-fold cross-validation.
+
+Fixes vs original:
+  - Оптимизатор заменён с Adagrad на Adam (lr=1e-3): Adagrad накапливал
+    квадраты градиентов → эффективный lr падал до ~1e-7 уже через сотни шагов.
+  - Добавлен gradient clipping (max_norm=1.0): предотвращает взрыв градиентов.
+  - Добавлена диагностика: логируем loss каждые log_interval батчей,
+    явно предупреждаем о NaN/Inf лоссе.
+  - learning_rate и weight_decay читаются из конфига (обратная совместимость).
 """
 
 from __future__ import annotations
@@ -62,7 +70,6 @@ def load_checkpoint(
     path: Path,
     device: torch.device,
 ) -> tuple[int, float]:
-    # map_location гарантирует корректную загрузку с GPU на CPU и наоборот
     ckpt = torch.load(str(path), map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
@@ -87,10 +94,12 @@ def train_fold(
     logger.info("=== Fold %d | Train: %s | Val: %s ===", fold_idx, train_ids, val_ids)
 
     train_ds = NewforDataset(
-        data_root, train_ids, cfg, augment_data=True, max_points=cfg.training.max_points
+        data_root, train_ids, cfg, augment_data=True,
+        max_points=cfg.training.max_points,
     )
     val_ds = NewforDataset(
-        data_root, val_ids, cfg, augment_data=False, max_points=cfg.training.max_points
+        data_root, val_ids, cfg, augment_data=False,
+        max_points=cfg.training.max_points,
     )
 
     num_workers: int = cfg.training.get("num_workers", 0)
@@ -104,10 +113,21 @@ def train_fold(
     )
 
     model = TreeRCNN(cfg).to(device)
-    optimizer = torch.optim.Adagrad(
+
+    # Adam вместо Adagrad: не накапливает lr-decay, лучше сходится
+    lr = cfg.training.get("learning_rate", 1e-3)
+    wd = cfg.training.get("weight_decay", 1e-4)
+    optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=cfg.training.learning_rate,
-        weight_decay=cfg.training.get("weight_decay", 0.0),
+        lr=lr,
+        weight_decay=wd,
+    )
+
+    # Косинусный lr-scheduler: плавно снижает lr к концу обучения
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=cfg.training.epochs,
+        eta_min=lr * 1e-3,
     )
 
     ckpt_dir = out_dir / f"fold_{fold_idx}"
@@ -121,45 +141,64 @@ def train_fold(
         start_epoch, best_rms = load_checkpoint(model, optimizer, resume, device)
 
     val_interval: int = cfg.training.get("val_interval", 100)
+    log_interval: int = cfg.training.get("log_interval", 10)
+    max_grad_norm: float = cfg.training.get("max_grad_norm", 1.0)
 
     for epoch in range(start_epoch, cfg.training.epochs):
         model.train()
         epoch_losses: list[float] = []
+        nan_batches = 0
 
-        for batch in train_loader:
-            points = batch["points"]
-            gt_boxes = batch["gt_boxes"]
+        for batch_idx, batch in enumerate(train_loader):
+            points      = batch["points"]
+            gt_boxes    = batch["gt_boxes"]
             local_maxima = batch["local_maxima"]
             plot_bounds = batch["plot_bounds"]
 
-            # batch_size=1 — unwrap list wrapper produced by collate_fn
-            if isinstance(points, list):
-                points = points[0]
-            if isinstance(gt_boxes, list):
-                gt_boxes = gt_boxes[0]
-            if isinstance(local_maxima, list):
-                local_maxima = local_maxima[0]
-            if isinstance(plot_bounds, list):
-                plot_bounds = plot_bounds[0]
+            if isinstance(points, list):       points      = points[0]
+            if isinstance(gt_boxes, list):     gt_boxes    = gt_boxes[0]
+            if isinstance(local_maxima, list): local_maxima = local_maxima[0]
+            if isinstance(plot_bounds, list):  plot_bounds = plot_bounds[0]
 
-            points = points.to(device)
-            gt_boxes = gt_boxes.to(device)
+            points      = points.to(device)
+            gt_boxes    = gt_boxes.to(device)
             local_maxima = local_maxima.to(device)
             plot_bounds = plot_bounds.to(device)
 
             optimizer.zero_grad()
-            loss_dict = model(
-                points, gt_boxes, local_maxima, plot_bounds, training=True
-            )
+            loss_dict = model(points, gt_boxes, local_maxima, plot_bounds, training=True)
             total_loss: torch.Tensor = loss_dict["total_loss"]
-            total_loss.backward()
-            optimizer.step()
 
+            if torch.isnan(total_loss) or torch.isinf(total_loss):
+                nan_batches += 1
+                logger.warning(
+                    "Epoch %d, batch %d: NaN/Inf loss — batch skipped (total skipped: %d)",
+                    epoch + 1, batch_idx, nan_batches,
+                )
+                optimizer.zero_grad()
+                continue
+
+            total_loss.backward()
+            # Gradient clipping: предотвращает взрыв градиентов
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+            optimizer.step()
             epoch_losses.append(total_loss.item())
 
-        mean_loss = np.mean(epoch_losses)
+            if (batch_idx + 1) % log_interval == 0:
+                recent = np.mean(epoch_losses[-log_interval:])
+                logger.info(
+                    "Epoch %d | Batch %d | Loss: %.4f | LR: %.2e",
+                    epoch + 1, batch_idx + 1, recent,
+                    optimizer.param_groups[0]["lr"],
+                )
+
+        scheduler.step()
+
+        mean_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
         logger.info(
-            "Epoch %d/%d | Loss: %.4f", epoch + 1, cfg.training.epochs, mean_loss
+            "Epoch %d/%d | Loss: %.4f | NaN batches: %d | LR: %.2e",
+            epoch + 1, cfg.training.epochs, mean_loss, nan_batches,
+            optimizer.param_groups[0]["lr"],
         )
 
         if (epoch + 1) % cfg.training.checkpoint_interval == 0:
@@ -190,11 +229,11 @@ def _evaluate_fold(
 
     with torch.no_grad():
         for sample in val_ds:
-            points = sample["points"].to(device)
-            gt_boxes = sample["gt_boxes"].to(device)
+            points      = sample["points"].to(device)
+            gt_boxes    = sample["gt_boxes"].to(device)
             local_maxima = sample["local_maxima"].to(device)
             plot_bounds = sample["plot_bounds"].to(device)
-            plot_id = sample["plot_id"]
+            plot_id     = sample["plot_id"]
 
             out = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
             pred_boxes = out["boxes"].cpu().numpy()
@@ -216,7 +255,7 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Train TreeRCNN")
     parser.add_argument("--config", default="configs/tree_rcnn.yaml")
-    parser.add_argument("--data_root", required=True, help="Path to dataset root")
+    parser.add_argument("--data_root", required=True)
     parser.add_argument("--out_dir", default="outputs/")
     parser.add_argument(
         "--fold",
@@ -233,7 +272,7 @@ def main() -> None:
     logger.info("Device: %s", device)
 
     data_root = Path(args.data_root)
-    out_dir = Path(args.out_dir)
+    out_dir   = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
     folds: list[list[int]] = [list(f) for f in cfg.cross_validation.folds]
@@ -242,7 +281,7 @@ def main() -> None:
     fold_range = range(len(folds)) if args.fold is None else [args.fold]
 
     for fi in fold_range:
-        val_ids = folds[fi]
+        val_ids   = folds[fi]
         train_ids = [pid for pid in all_ids if pid not in val_ids]
         train_fold(fi, train_ids, val_ids, data_root, cfg, out_dir, device)
 

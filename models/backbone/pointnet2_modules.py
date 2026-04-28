@@ -1,5 +1,11 @@
 """
 PointNet++ Set Abstraction (SSG) and Feature Propagation modules.
+
+Fixes vs original:
+  - BatchNorm1d заменён на LayerNorm: BN с batch_size=1 и малым числом точек
+    вызывает var=0 → NaN-градиенты. LN нормализует по channel-измерению,
+    работает корректно при любом числе точек.
+  - _apply_mlp больше не делает reshape и не требует BN1d.
 """
 
 from __future__ import annotations
@@ -38,10 +44,15 @@ class PointNetSetAbstraction(nn.Module):
         self.radius = radius
         self.nsample = nsample
 
+        # LayerNorm вместо BatchNorm1d: корректен при batch=1 и любом N
         layers: list[nn.Module] = []
         last = in_channel
         for out in mlp:
-            layers += [nn.Linear(last, out), nn.BatchNorm1d(out), nn.ReLU(inplace=True)]
+            layers += [
+                nn.Linear(last, out),
+                nn.LayerNorm(out),
+                nn.ReLU(inplace=True),
+            ]
             last = out
         self.mlp = nn.Sequential(*layers)
         self.out_channels = last
@@ -62,41 +73,35 @@ class PointNetSetAbstraction(nn.Module):
 
         if self.npoint is None:
             # Global abstraction
-            if points is not None:
-                combined = torch.cat([xyz, points], dim=-1)  # (B, N, 3+C)
-            else:
-                combined = xyz
-            out = self._apply_mlp(combined)  # (B, N, D)
-            new_points = out.max(dim=1)[0]  # (B, D)
-            new_points = new_points.unsqueeze(1)  # (B, 1, D)
+            combined = torch.cat([xyz, points], dim=-1) if points is not None else xyz
+            out = self._apply_mlp(combined)          # (B, N, D)
+            new_points = out.max(dim=1)[0]           # (B, D)
+            new_points = new_points.unsqueeze(1)     # (B, 1, D)
             return None, new_points
 
-        # Sample centroids
+        # Sample centroids via FPS
         fps_idx = farthest_point_sample(xyz, self.npoint)  # (B, S)
-        new_xyz = index_points(xyz, fps_idx)  # (B, S, 3)
+        new_xyz = index_points(xyz, fps_idx)               # (B, S, 3)
 
-        # Group neighbours
+        # Group neighbours with ball query
         idx = ball_query(self.radius, self.nsample, xyz, new_xyz)  # (B, S, K)
-        grouped_xyz = index_points(xyz, idx)  # (B, S, K, 3)
-        grouped_xyz -= new_xyz.unsqueeze(2)  # local coords
+        grouped_xyz = index_points(xyz, idx)               # (B, S, K, 3)
+        grouped_xyz = grouped_xyz - new_xyz.unsqueeze(2)   # local coords
 
         if points is not None:
-            grouped_pts = index_points(points, idx)  # (B, S, K, C)
+            grouped_pts = index_points(points, idx)        # (B, S, K, C)
             combined = torch.cat([grouped_xyz, grouped_pts], dim=-1)
         else:
-            combined = grouped_xyz  # (B, S, K, 3)
+            combined = grouped_xyz                         # (B, S, K, 3)
 
-        out = self._apply_mlp(combined)  # (B, S, K, D)
-        new_points = out.max(dim=2)[0]  # (B, S, D)
+        out = self._apply_mlp(combined)                    # (B, S, K, D)
+        new_points = out.max(dim=2)[0]                     # (B, S, D)
         return new_xyz, new_points
 
     def _apply_mlp(self, x: Tensor) -> Tensor:
-        """Apply MLP with BN; x may be (B, S, K, C) or (B, N, C)."""
-        shape = x.shape
-        x_flat = x.reshape(-1, shape[-1])
-        for layer in self.mlp:
-            if isinstance(layer, nn.BatchNorm1d):
-                x_flat = layer(x_flat)
-            else:
-                x_flat = layer(x_flat)
-        return x_flat.reshape(*shape[:-1], -1)
+        """
+        Apply MLP point-wise; x may be (B, S, K, C) or (B, N, C).
+        LayerNorm работает по последнему измерению (channel), поэтому
+        reshape не нужен — применяем Sequential напрямую.
+        """
+        return self.mlp(x)

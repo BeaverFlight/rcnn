@@ -1,12 +1,15 @@
 """
 Stage 1: Proposal Generation Network.
-Uses PointNet++ to extract per-window features and predict (cls, reg) per anchor.
+
+Fixes vs original:
+  - forward() теперь принимает батч якорей (B, N, 3) вместо одного за раз.
+    Это позволяет обработать все якоря одним GPU-вызовом вместо Python-цикла.
+  - extract_features() остаётся публичным для внешнего использования.
 """
 
 from __future__ import annotations
 
 import logging
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -19,15 +22,17 @@ logger = logging.getLogger(__name__)
 
 class ProposalHead(nn.Module):
     """
-    Stage-1 head: processes points per sliding window with PointNet++,
-    then predicts objectness score and box delta per anchor.
+    Stage-1 head: обрабатывает батч окон PointNet++,
+    предсказывает objectness score и box delta на якорь.
+
+    forward(xyz) принимает (B, N, 3) — батч из B окон по N точек каждое.
+    Возвращает (cls_logits: (B,1), reg_deltas: (B,4)).
     """
 
     def __init__(self, cfg) -> None:
         super().__init__()
         pn2 = cfg.pointnet2
 
-        # Layer 0: input is xyz only → in_channel = 3
         sa0_mlp = list(pn2.sa_layers[0].mlp)
         sa1_mlp = list(pn2.sa_layers[1].mlp)
         sa2_mlp = list(pn2.sa_layers[2].mlp)
@@ -55,8 +60,8 @@ class ProposalHead(nn.Module):
         )
 
         feat_dim = sa2_mlp[-1]
-        self.cls_head = nn.Linear(feat_dim, 1)  # objectness logit
-        self.reg_head = nn.Linear(feat_dim, 4)  # (tx, ty, tw, th)
+        self.cls_head = nn.Linear(feat_dim, 1)   # objectness logit
+        self.reg_head = nn.Linear(feat_dim, 4)   # (tx, ty, tw, th)
 
     def extract_features(self, xyz: Tensor) -> Tensor:
         """
@@ -68,15 +73,15 @@ class ProposalHead(nn.Module):
         Returns:
             feat: (B, feat_dim)
         """
-        xyz1, f1 = self.sa1(xyz, None)  # (B, 64, 64)
-        xyz2, f2 = self.sa2(xyz1, f1)  # (B, 32, 128)
-        _, f3 = self.sa3(xyz2, f2)  # (B, 1, 512)
-        return f3.squeeze(1)  # (B, 512)
+        xyz1, f1 = self.sa1(xyz, None)    # (B, 64, 64)
+        xyz2, f2 = self.sa2(xyz1, f1)    # (B, 32, 128)
+        _, f3   = self.sa3(xyz2, f2)     # (B, 1, 512)
+        return f3.squeeze(1)             # (B, 512)
 
     def forward(self, xyz: Tensor) -> tuple[Tensor, Tensor]:
         """
         Args:
-            xyz: (B, N, 3)
+            xyz: (B, N, 3)  — батч B якорных окон, каждое N точек
 
         Returns:
             cls_logits: (B, 1)
