@@ -20,8 +20,8 @@ def sigmoid_focal_loss(
     Args:
         inputs:    (N,) raw logits
         targets:   (N,) binary labels {0, 1}
-        alpha:     balancing factor
-        gamma:     focusing exponent
+        alpha:     weight for positives (higher = сильнее штрафуем пропуск дерева)
+        gamma:     focusing exponent (higher = сильнее штрафуем уверенные ошибки)
         reduction: 'none' | 'mean' | 'sum'
 
     Returns:

@@ -13,7 +13,7 @@ from torch import Tensor
 
 from models.stage1.anchor_generator import AnchorGenerator
 from models.stage1.proposal_head import ProposalHead
-from models.stage1.target_assigner import assign_targets
+from models.stage1.target_assinger import assign_targets
 from models.stage2.refinement_head import RefinementHead
 from models.losses.focal_loss import sigmoid_focal_loss
 from models.losses.smooth_l1 import smooth_l1_loss
@@ -131,6 +131,11 @@ class TreeRCNN(nn.Module):
         self.stage2 = RefinementHead(cfg)
         self.lambda_reg: float = cfg.training.lambda_reg
 
+        # Focal loss параметры из конфига (с дефолтами)
+        fl = cfg.training.get("focal_loss", {})
+        self._focal_alpha: float = float(fl.get("alpha", 0.25) if fl else 0.25)
+        self._focal_gamma: float = float(fl.get("gamma", 2.0) if fl else 2.0)
+
     def forward(
         self,
         points: Tensor,
@@ -234,7 +239,11 @@ class TreeRCNN(nn.Module):
             points, sampled_anchors, infer_mode=False, tag="s1_loss"
         )
         sampled_labels = labels[sampled].float()
-        cls_loss = sigmoid_focal_loss(cls_logits.squeeze(-1), sampled_labels)
+        cls_loss = sigmoid_focal_loss(
+            cls_logits.squeeze(-1), sampled_labels,
+            alpha=self._focal_alpha,
+            gamma=self._focal_gamma,
+        )
 
         pos_mask = sampled_labels == 1
         reg_loss = (
@@ -270,7 +279,7 @@ class TreeRCNN(nn.Module):
             return cls_out, reg_out
 
         valid_pts = [pts_list[i] for i in valid_idx]
-        mb = _STAGE1_INFER_BATCH
+        mb = int(getattr(self.cfg.training, "stage1_infer_batch", _STAGE1_INFER_BATCH))
         t_fwd = time.perf_counter()
 
         ctx = torch.no_grad() if infer_mode else torch.enable_grad()
@@ -295,12 +304,19 @@ class TreeRCNN(nn.Module):
         cfg_nms = self.cfg.stage1_nms
         t0 = time.perf_counter()
 
+        ad_score_thr = float(getattr(cfg_nms, "ad_score_threshold", 0.0))
+
         # --- ad proposals ---
         if len(ad) > 0:
             cls_ad, reg_ad = self._run_stage1_on_anchors(points, ad, infer_mode=True, tag="ad")
             scores_ad = torch.sigmoid(cls_ad.squeeze(-1))
             boxes_ad  = decode_boxes(reg_ad, ad)
-            keep_ad   = nms3d(boxes_ad, scores_ad, cfg_nms.ad_iouv_threshold, cfg_nms.ad_max_proposals)
+            keep_ad   = nms3d(
+                boxes_ad, scores_ad,
+                cfg_nms.ad_iouv_threshold,
+                cfg_nms.ad_max_proposals,
+                score_threshold=ad_score_thr,
+            )
             props_ad  = boxes_ad[keep_ad]
             logger.debug("  ad NMS: %d → %d", len(ad), len(props_ad))
         else:
@@ -326,7 +342,8 @@ class TreeRCNN(nn.Module):
                 sl = slice(offset, offset + sz)
                 keep = nms3d(
                     boxes_al_all[sl], scores_al_all[sl],
-                    cfg_nms.al_iouv_threshold, cfg_nms.al_max_proposals_per_maxima,
+                    cfg_nms.al_iouv_threshold,
+                    cfg_nms.al_max_proposals_per_maxima,
                 )
                 parts.append(boxes_al_all[sl][keep])
                 offset += sz
@@ -359,7 +376,11 @@ class TreeRCNN(nn.Module):
         cls_logits, reg_deltas = self.stage2(pts_list, sampled_props)
 
         sampled_labels = labels[sampled].float()
-        cls_loss = sigmoid_focal_loss(cls_logits.squeeze(-1), sampled_labels)
+        cls_loss = sigmoid_focal_loss(
+            cls_logits.squeeze(-1), sampled_labels,
+            alpha=self._focal_alpha,
+            gamma=self._focal_gamma,
+        )
         pos_mask = sampled_labels == 1
         reg_loss = (
             smooth_l1_loss(reg_deltas[pos_mask], reg_targets[sampled][pos_mask])
