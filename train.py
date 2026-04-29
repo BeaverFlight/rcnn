@@ -120,16 +120,17 @@ def save_checkpoint(
     epoch: int,
     best_score: float,
     path: Path,
+    cfg=None,
 ) -> None:
-    torch.save(
-        {
-            "epoch": epoch,
-            "model_state_dict": model.state_dict(),
-            "optimizer_state_dict": optimizer.state_dict(),
-            "best_score": best_score,
-        },
-        str(path),
-    )
+    payload = {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "best_score": best_score,
+    }
+    if cfg is not None:
+        payload["cfg"] = OmegaConf.to_container(cfg, resolve=True)
+    torch.save(payload, str(path))
     logger.info("Checkpoint saved: %s (epoch %d)", path, epoch)
 
 
@@ -316,6 +317,7 @@ def train_fold(
             save_checkpoint(
                 model, optimizer, epoch + 1, best_score,
                 ckpt_dir / "latest.pth",
+                cfg=cfg,
             )
 
         # ---- валидация ---------------------------------------------------
@@ -332,7 +334,8 @@ def train_fold(
             epoch_json = ckpt_dir / f"epoch_{epoch + 1:04d}.json"
 
             save_checkpoint(
-                model, optimizer, epoch + 1, best_score, epoch_ckpt
+                model, optimizer, epoch + 1, best_score, epoch_ckpt,
+                cfg=cfg,
             )
             epoch_json.write_text(
                 json.dumps(info, indent=2, ensure_ascii=False)
