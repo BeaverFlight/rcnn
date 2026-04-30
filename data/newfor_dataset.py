@@ -44,13 +44,13 @@ class NewforDataset(Dataset):
         plot_ids: list[int],
         cfg: DictConfig,
         augment_data: bool = True,
-        max_points: int = 40_000,
+        max_points: int | None = 40_000,
     ) -> None:
         self.root = Path(root)
         self.plot_ids = plot_ids
         self.cfg = cfg
         self.augment_data = augment_data
-        self.max_points = max_points
+        self.max_points = max_points  # None = use all points (no subsampling)
         self._plots: list[PlotData] = []
         self._load_all()
 
@@ -113,8 +113,8 @@ class NewforDataset(Dataset):
             plot.plot_id, x_min, x_max, y_min, y_max,
         )
 
-        # Subsample
-        if len(points) > self.max_points:
+        # Subsample only if max_points is set
+        if self.max_points is not None and len(points) > self.max_points:
             idx_sub = np.random.choice(len(points), self.max_points, replace=False)
             points = points[idx_sub]
 
