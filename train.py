@@ -177,7 +177,12 @@ def _evaluate_fold(
             ref     = gt_boxes.cpu().numpy()
             ref_xyz = np.column_stack([ref[:, 0], ref[:, 1], ref[:, 5]])
 
-            results.append(newfor_matching(detected, ref_xyz, plot_id=plot_id))
+            pm = newfor_matching(detected, ref_xyz, plot_id=plot_id)
+            logger.info(
+                "Plot %d: detected=%d reference=%d matched=%d recall=%.1f%%",
+                plot_id, pm.n_test, pm.n_ref, pm.n_match, pm.rmr * 100,
+            )
+            results.append(pm)
 
     return results
 
@@ -204,11 +209,20 @@ def train_fold(
 
     train_ds = NewforDataset(
         data_root, train_ids, cfg,
-        augment_data=True, max_points=cfg.training.max_points,
+        augment_data=True,
+        max_points=cfg.training.max_points,
     )
+    # Validation: max_points=None — use full point cloud for accurate evaluation
+    val_max_points = cfg.training.get("val_max_points", None)
     val_ds = NewforDataset(
         data_root, val_ids, cfg,
-        augment_data=False, max_points=cfg.training.max_points,
+        augment_data=False,
+        max_points=val_max_points,
+    )
+    logger.info(
+        "Val dataset: %d plots, max_points=%s (None = full cloud)",
+        len(val_ds),
+        val_max_points,
     )
 
     num_workers: int = cfg.training.get("num_workers", 0)
@@ -235,8 +249,10 @@ def train_fold(
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
+    # CosineAnnealing: LR decays to eta_min = lr * 0.1 (not lr * 1e-3)
+    # to avoid near-zero LR freezing training at later epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=cfg.training.epochs, eta_min=lr * 1e-3,
+        optimizer, T_max=cfg.training.epochs, eta_min=lr * 0.1,
     )
 
     ckpt_dir = out_dir / f"fold_{fold_idx}"
