@@ -26,7 +26,10 @@ _MAX_POINTS_PER_BOX = 512
 _MIN_POINTS_FOR_NET = 4
 _ANCHOR_CHUNK = 1024
 _STAGE1_INFER_BATCH = 64
-_STAGE2_INFER_CHUNK = 256  # число proposals в одном батче stage2 inference
+# Увеличен с 256 до 2048: при ~1800 proposals даёт 1 итерацию вместо 7.
+# Маска (2048, N_points) строится в CUDA, CPU лишь собирает результат.
+# Снизь до 512-1024 если получаешь OOM при val_max_points > 300_000.
+_STAGE2_INFER_CHUNK = 2048
 
 
 def _subsample_points_in_box(
@@ -118,19 +121,27 @@ def _subsample_points_batch_proposals(
 
     Identical logic to _subsample_points_batch but WITHOUT centring
     (Stage 2 RefinementHead receives absolute coordinates).
-    Also uses a smaller default chunk to keep VRAM usage bounded
-    during inference with potentially large point clouds.
 
-    Complexity: O(chunk * N_points) per iteration instead of
-                O(P * N_points) with a Python loop over proposals.
+    Key optimisation: points и proposals явно переносятся на один device
+    перед построением маски, чтобы все тензорные операции выполнялись
+    в CUDA, а не на CPU. Без этого broadcasting (chunk, N_points) мог
+    незаметно упасть на CPU и вызвать 100% загрузку процессора.
+
+    chunk=2048 по умолчанию: при ~1800 proposals = 1 итерация вместо 7.
+    Снизь до 512-1024 при OOM (val_max_points > 300_000 + мало VRAM).
     """
+    # --- Гарантируем GPU-выполнение -----------------------------------
     device = points.device
+    if proposals.device != device:
+        proposals = proposals.to(device)
+
     P = proposals.shape[0]
     result: list[Tensor] = [None] * P  # type: ignore[list-item]
 
-    px = points[:, 0]
-    py = points[:, 1]
-    pz = points[:, 2]
+    # Все координатные тензоры явно на device
+    px = points[:, 0].to(device)
+    py = points[:, 1].to(device)
+    pz = points[:, 2].to(device)
 
     total_chunks = (P + chunk - 1) // chunk
     logger.info(
@@ -140,17 +151,17 @@ def _subsample_points_batch_proposals(
 
     for chunk_idx, start in enumerate(range(0, P, chunk), start=1):
         end = min(start + chunk, P)
-        prop = proposals[start:end]  # (chunk, 6)
+        prop = proposals[start:end]  # (chunk, 6) — уже на device
 
         t_chunk = time.perf_counter()
 
-        cx = prop[:, 0].unsqueeze(1)   # (chunk, 1)
+        cx = prop[:, 0].unsqueeze(1)   # (chunk, 1) on device
         cy = prop[:, 1].unsqueeze(1)
         w  = prop[:, 3].unsqueeze(1)
         l  = prop[:, 4].unsqueeze(1)
         h  = prop[:, 5].unsqueeze(1)
 
-        # mask shape: (chunk, N_points)  — no Python loop over proposals
+        # mask: (chunk, N_points) — строится в CUDA
         mask = (
             (px.unsqueeze(0) >= cx - w / 2)
             & (px.unsqueeze(0) <= cx + w / 2)
@@ -160,8 +171,9 @@ def _subsample_points_batch_proposals(
             & (pz.unsqueeze(0) <= h)
         )
 
-        counts = mask.sum(dim=1)          # (chunk,)
+        counts = mask.sum(dim=1)           # (chunk,) on device
         _, point_idx = mask.nonzero(as_tuple=True)
+        # .tolist() — единственный CPU-переход, нужен для torch.split
         groups = torch.split(point_idx, counts.tolist())
 
         non_empty = 0
@@ -176,7 +188,7 @@ def _subsample_points_batch_proposals(
                 perm = torch.randperm(len(grp), device=device)[:n]
                 grp = grp[perm]
             total_kept += len(grp)
-            result[start + i] = points[grp].clone()  # absolute coords for Stage 2
+            result[start + i] = points[grp].clone()  # absolute coords, on device
 
         logger.info(
             "  Sampling chunk %d/%d (props %d-%d): non_empty=%d kept_pts=%d elapsed=%.2fs",
@@ -504,7 +516,7 @@ class TreeRCNN(nn.Module):
                 a time using broadcasting; the boolean mask is (chunk, N) instead
                 of being rebuilt from scratch for every single proposal.
                 → O(ceil(P / chunk) * chunk * N)  — same asymptotic but without
-                  Python-loop overhead; runs mostly in C++/CUDA tensor ops.
+                  Python-loop overhead; runs mostly in CUDA tensor ops.
         """
         cfg_nms = self.cfg.stage2_nms
 
