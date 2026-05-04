@@ -26,11 +26,13 @@ _MAX_POINTS_PER_BOX = 512
 _MIN_POINTS_FOR_NET = 4
 _ANCHOR_CHUNK = 1024
 _STAGE1_INFER_BATCH = 64
+_STAGE2_INFER_CHUNK = 256  # число proposals в одном батче stage2 inference
 
 
 def _subsample_points_in_box(
     points: Tensor, box: Tensor, n: int = _MAX_POINTS_PER_BOX
 ) -> Tensor:
+    """Single-box fallback (used only in _stage2_loss during training)."""
     x, y, z_c, w, l, h = box.unbind()
     mask = (
         (points[:, 0] >= x - w / 2)
@@ -53,6 +55,11 @@ def _subsample_points_batch(
     n: int = _MAX_POINTS_PER_BOX,
     chunk: int = _ANCHOR_CHUNK,
 ) -> list[Tensor]:
+    """
+    Vectorised point-in-box sampling for a batch of anchors.
+    Processes anchors in chunks to avoid OOM on large point clouds.
+    Returns list of (N_i, 3) tensors with points centred on each anchor.
+    """
     device = points.device
     A = anchors.shape[0]
     result: list[Tensor] = [None] * A  # type: ignore[list-item]
@@ -100,6 +107,67 @@ def _subsample_points_batch(
     return result  # type: ignore[return-value]
 
 
+def _subsample_points_batch_proposals(
+    points: Tensor,
+    proposals: Tensor,
+    n: int = _MAX_POINTS_PER_BOX,
+    chunk: int = _STAGE2_INFER_CHUNK,
+) -> list[Tensor]:
+    """
+    Vectorised point-in-box sampling for Stage 2 proposals.
+
+    Identical logic to _subsample_points_batch but WITHOUT centring
+    (Stage 2 RefinementHead receives absolute coordinates).
+    Also uses a smaller default chunk to keep VRAM usage bounded
+    during inference with potentially large point clouds.
+
+    Complexity: O(chunk * N_points) per iteration instead of
+                O(P * N_points) with a Python loop over proposals.
+    """
+    device = points.device
+    P = proposals.shape[0]
+    result: list[Tensor] = [None] * P  # type: ignore[list-item]
+
+    px = points[:, 0]
+    py = points[:, 1]
+    pz = points[:, 2]
+
+    for start in range(0, P, chunk):
+        end = min(start + chunk, P)
+        prop = proposals[start:end]  # (chunk, 6)
+
+        cx = prop[:, 0].unsqueeze(1)   # (chunk, 1)
+        cy = prop[:, 1].unsqueeze(1)
+        w  = prop[:, 3].unsqueeze(1)
+        l  = prop[:, 4].unsqueeze(1)
+        h  = prop[:, 5].unsqueeze(1)
+
+        # mask shape: (chunk, N_points)  — no Python loop over proposals
+        mask = (
+            (px.unsqueeze(0) >= cx - w / 2)
+            & (px.unsqueeze(0) <= cx + w / 2)
+            & (py.unsqueeze(0) >= cy - l / 2)
+            & (py.unsqueeze(0) <= cy + l / 2)
+            & (pz.unsqueeze(0) >= 0)
+            & (pz.unsqueeze(0) <= h)
+        )
+
+        counts = mask.sum(dim=1)          # (chunk,)
+        _, point_idx = mask.nonzero(as_tuple=True)
+        groups = torch.split(point_idx, counts.tolist())
+
+        for i, grp in enumerate(groups):
+            if len(grp) == 0:
+                result[start + i] = points.new_zeros(0, 3)
+                continue
+            if len(grp) > n:
+                perm = torch.randperm(len(grp), device=device)[:n]
+                grp = grp[perm]
+            result[start + i] = points[grp].clone()  # absolute coords for Stage 2
+
+    return result  # type: ignore[return-value]
+
+
 def _pad_windows_to_batch(
     pts_list: list[Tensor],
     device: torch.device,
@@ -131,10 +199,13 @@ class TreeRCNN(nn.Module):
         self.stage2 = RefinementHead(cfg)
         self.lambda_reg: float = cfg.training.lambda_reg
 
-        # Focal loss параметры из конфига (с дефолтами)
         fl = cfg.training.get("focal_loss", {})
         self._focal_alpha: float = float(fl.get("alpha", 0.25) if fl else 0.25)
         self._focal_gamma: float = float(fl.get("gamma", 2.0) if fl else 2.0)
+
+        self._s2_chunk: int = int(
+            cfg.training.get("stage2_infer_chunk", _STAGE2_INFER_CHUNK)
+        )
 
     def forward(
         self,
@@ -215,7 +286,12 @@ class TreeRCNN(nn.Module):
             )
             return {**loss_s1, **loss_s2, "total_loss": total}
 
+        t5 = time.perf_counter()
         final_boxes, final_scores = self._stage2_inference(points, proposals)
+        logger.debug(
+            "S2 inference done: %d boxes (%.2fs)",
+            len(final_boxes), time.perf_counter() - t5,
+        )
         logger.debug("Inference done (%.2fs)", time.perf_counter() - t0)
         return {"boxes": final_boxes, "scores": final_scores}
 
@@ -372,6 +448,7 @@ class TreeRCNN(nn.Module):
         )
         sampled_props = proposals[sampled]
         logger.debug("S2 loss: %d sampled proposals", len(sampled_props))
+        # Training path: Python loop допустим — sampled proposals << всех proposals
         pts_list = [_subsample_points_in_box(points, p) for p in sampled_props]
         cls_logits, reg_deltas = self.stage2(pts_list, sampled_props)
 
@@ -390,16 +467,43 @@ class TreeRCNN(nn.Module):
         total = cls_loss + self.lambda_reg * reg_loss
         return {"loss_stage2_cls": cls_loss, "loss_stage2_reg": reg_loss, "total_loss_stage2": total}
 
-    def _stage2_inference(self, points, proposals):
+    def _stage2_inference(self, points: Tensor, proposals: Tensor):
+        """
+        Stage 2 inference with vectorised point sampling.
+
+        BEFORE: Python loop `[_subsample_points_in_box(points, p) for p in proposals]`
+                → O(P * N) where P = number of proposals, N = number of points
+                → hangs on large point clouds (e.g. 6063 proposals * 1.1M points)
+
+        AFTER:  _subsample_points_batch_proposals processes `chunk` proposals at
+                a time using broadcasting; the boolean mask is (chunk, N) instead
+                of being rebuilt from scratch for every single proposal.
+                → O(ceil(P / chunk) * chunk * N)  — same asymptotic but without
+                  Python-loop overhead; runs mostly in C++/CUDA tensor ops.
+        """
         cfg_nms = self.cfg.stage2_nms
-        pts_list = [_subsample_points_in_box(points, p) for p in proposals]
+        t_sample = time.perf_counter()
+
+        pts_list = _subsample_points_batch_proposals(
+            points, proposals, n=_MAX_POINTS_PER_BOX, chunk=self._s2_chunk
+        )
+        logger.debug(
+            "  S2 point sampling: %d proposals, chunk=%d  (%.2fs)",
+            len(proposals), self._s2_chunk, time.perf_counter() - t_sample,
+        )
+
+        t_fwd = time.perf_counter()
         with torch.no_grad():
             cls_logits, reg_deltas = self.stage2(pts_list, proposals)
+        logger.debug("  S2 forward (%.2fs)", time.perf_counter() - t_fwd)
+
         scores  = torch.sigmoid(cls_logits.squeeze(-1))
         refined = decode_boxes(reg_deltas, proposals)
+
         score_mask = scores >= cfg_nms.score_threshold
         refined, scores = refined[score_mask], scores[score_mask]
         if len(refined) == 0:
             return refined, scores
+
         keep = nms3d(refined, scores, cfg_nms.iouv_threshold)
         return refined[keep], scores[keep]
