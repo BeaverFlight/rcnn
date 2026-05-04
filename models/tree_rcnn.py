@@ -132,9 +132,17 @@ def _subsample_points_batch_proposals(
     py = points[:, 1]
     pz = points[:, 2]
 
-    for start in range(0, P, chunk):
+    total_chunks = (P + chunk - 1) // chunk
+    logger.info(
+        "  Stage2 sampling: %d proposals / %d points / chunk=%d / total_chunks=%d",
+        P, len(points), chunk, total_chunks,
+    )
+
+    for chunk_idx, start in enumerate(range(0, P, chunk), start=1):
         end = min(start + chunk, P)
         prop = proposals[start:end]  # (chunk, 6)
+
+        t_chunk = time.perf_counter()
 
         cx = prop[:, 0].unsqueeze(1)   # (chunk, 1)
         cy = prop[:, 1].unsqueeze(1)
@@ -156,14 +164,25 @@ def _subsample_points_batch_proposals(
         _, point_idx = mask.nonzero(as_tuple=True)
         groups = torch.split(point_idx, counts.tolist())
 
+        non_empty = 0
+        total_kept = 0
+
         for i, grp in enumerate(groups):
             if len(grp) == 0:
                 result[start + i] = points.new_zeros(0, 3)
                 continue
+            non_empty += 1
             if len(grp) > n:
                 perm = torch.randperm(len(grp), device=device)[:n]
                 grp = grp[perm]
+            total_kept += len(grp)
             result[start + i] = points[grp].clone()  # absolute coords for Stage 2
+
+        logger.info(
+            "  Sampling chunk %d/%d (props %d-%d): non_empty=%d kept_pts=%d elapsed=%.2fs",
+            chunk_idx, total_chunks, start, end - 1,
+            non_empty, total_kept, time.perf_counter() - t_chunk,
+        )
 
     return result  # type: ignore[return-value]
 
@@ -254,6 +273,12 @@ class TreeRCNN(nn.Module):
         proposals = self._stage1_proposals(points, ad, al_flat, device)
         logger.debug("S1 proposals done: %d  (%.2fs)", len(proposals), time.perf_counter() - t3)
 
+        if not training:
+            logger.info(
+                "  Stage1 -> %d proposals (%.2fs)",
+                len(proposals), time.perf_counter() - t3,
+            )
+
         if len(proposals) == 0:
             zero = torch.tensor(0.0, device=device)
             logger.warning("No S1 proposals — zero loss")
@@ -288,8 +313,8 @@ class TreeRCNN(nn.Module):
 
         t5 = time.perf_counter()
         final_boxes, final_scores = self._stage2_inference(points, proposals)
-        logger.debug(
-            "S2 inference done: %d boxes (%.2fs)",
+        logger.info(
+            "  Stage2 inference done: %d final boxes (%.2fs total)",
             len(final_boxes), time.perf_counter() - t5,
         )
         logger.debug("Inference done (%.2fs)", time.perf_counter() - t0)
@@ -482,28 +507,48 @@ class TreeRCNN(nn.Module):
                   Python-loop overhead; runs mostly in C++/CUDA tensor ops.
         """
         cfg_nms = self.cfg.stage2_nms
-        t_sample = time.perf_counter()
 
+        # ---------- sampling -------------------------------------------
+        t_sample = time.perf_counter()
         pts_list = _subsample_points_batch_proposals(
             points, proposals, n=_MAX_POINTS_PER_BOX, chunk=self._s2_chunk
         )
-        logger.debug(
-            "  S2 point sampling: %d proposals, chunk=%d  (%.2fs)",
-            len(proposals), self._s2_chunk, time.perf_counter() - t_sample,
+        logger.info(
+            "  Stage2 sampling done in %.2fs",
+            time.perf_counter() - t_sample,
         )
 
+        # ---------- network forward ------------------------------------
+        logger.info("  Stage2 forward pass started...")
         t_fwd = time.perf_counter()
         with torch.no_grad():
             cls_logits, reg_deltas = self.stage2(pts_list, proposals)
-        logger.debug("  S2 forward (%.2fs)", time.perf_counter() - t_fwd)
+        logger.info(
+            "  Stage2 forward done in %.2fs",
+            time.perf_counter() - t_fwd,
+        )
 
+        # ---------- score filtering ------------------------------------
         scores  = torch.sigmoid(cls_logits.squeeze(-1))
         refined = decode_boxes(reg_deltas, proposals)
 
+        before_thr = len(scores)
         score_mask = scores >= cfg_nms.score_threshold
         refined, scores = refined[score_mask], scores[score_mask]
+        logger.info(
+            "  Stage2 score filter: %d -> %d boxes (thr=%.2f)",
+            before_thr, len(refined), cfg_nms.score_threshold,
+        )
+
         if len(refined) == 0:
+            logger.info("  Stage2 NMS skipped (0 boxes after score filter)")
             return refined, scores
 
+        # ---------- NMS ------------------------------------------------
+        t_nms = time.perf_counter()
         keep = nms3d(refined, scores, cfg_nms.iouv_threshold)
+        logger.info(
+            "  Stage2 NMS done in %.2fs: %d -> %d boxes",
+            time.perf_counter() - t_nms, len(refined), len(keep),
+        )
         return refined[keep], scores[keep]

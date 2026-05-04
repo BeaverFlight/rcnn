@@ -18,6 +18,7 @@ import json
 import logging
 import random
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -171,11 +172,20 @@ def _evaluate_fold(
             plot_id      = sample["plot_id"]
 
             logger.info(
-                "Val plot %d: %d points, %d GT trees",
+                "Val plot %d: %d points, %d GT trees — starting inference...",
                 plot_id, len(points), len(gt_boxes),
             )
 
+            t_plot = time.perf_counter()
             out = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
+            elapsed = time.perf_counter() - t_plot
+
+            n_pred = len(out["boxes"])
+            logger.info(
+                "Val plot %d: inference done in %.2fs, predicted_boxes=%d",
+                plot_id, elapsed, n_pred,
+            )
+
             detected = extract_tree_positions(
                 out["boxes"].cpu().numpy(), points.cpu().numpy()
             )
@@ -184,8 +194,11 @@ def _evaluate_fold(
 
             pm = newfor_matching(detected, ref_xyz, plot_id=plot_id)
             logger.info(
-                "Plot %d: detected=%d reference=%d matched=%d recall=%.1f%%",
-                plot_id, pm.n_test, pm.n_ref, pm.n_match, pm.rmr * 100,
+                "Val plot %d: detected=%d reference=%d matched=%d "
+                "recall=%.1f%% precision=%.1f%%",
+                plot_id, pm.n_test, pm.n_ref, pm.n_match,
+                pm.rmr * 100,
+                (pm.n_match / pm.n_test * 100) if pm.n_test > 0 else 0.0,
             )
             results.append(pm)
 
@@ -348,8 +361,19 @@ def train_fold(
 
         # ---- валидация ---------------------------------------------------
         if (epoch + 1) % val_interval == 0 and len(val_ds) > 0:
+            logger.info(
+                "--- Validation started (epoch %d, %d plots) ---",
+                epoch + 1, len(val_ds),
+            )
+            t_val = time.perf_counter()
+
             plot_metrics = _evaluate_fold(model, val_ds, cfg, device)
             score, info  = _quality_score(plot_metrics)
+
+            logger.info(
+                "--- Validation finished in %.2fs ---",
+                time.perf_counter() - t_val,
+            )
 
             info["epoch"]      = epoch + 1
             info["fold"]       = fold_idx
