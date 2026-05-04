@@ -170,6 +170,11 @@ def _evaluate_fold(
             plot_bounds  = sample["plot_bounds"]   # list[float] — не нужен .to()
             plot_id      = sample["plot_id"]
 
+            logger.info(
+                "Val plot %d: %d points, %d GT trees",
+                plot_id, len(points), len(gt_boxes),
+            )
+
             out = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
             detected = extract_tree_positions(
                 out["boxes"].cpu().numpy(), points.cpu().numpy()
@@ -212,17 +217,22 @@ def train_fold(
         augment_data=True,
         max_points=cfg.training.max_points,
     )
-    # Validation: max_points=None — use full point cloud for accurate evaluation
-    val_max_points = cfg.training.get("val_max_points", None)
+
+    # Validation uses a separate max_points cap.
+    # IMPORTANT: do NOT set this to None — stage2 inference calls
+    # _subsample_points_in_box in a Python loop over all proposals,
+    # so with a full point cloud (1-4M pts) and thousands of proposals
+    # the loop becomes O(proposals * points) and hangs indefinitely.
+    # Default 200_000 keeps local density sufficient while bounding runtime.
+    val_max_points: int = cfg.training.get("val_max_points", 200_000)
     val_ds = NewforDataset(
         data_root, val_ids, cfg,
         augment_data=False,
         max_points=val_max_points,
     )
     logger.info(
-        "Val dataset: %d plots, max_points=%s (None = full cloud)",
-        len(val_ds),
-        val_max_points,
+        "Val dataset: %d plots, val_max_points=%d",
+        len(val_ds), val_max_points,
     )
 
     num_workers: int = cfg.training.get("num_workers", 0)
