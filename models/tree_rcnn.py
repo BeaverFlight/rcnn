@@ -1,16 +1,15 @@
 """
 TreeRCNN: two-stage 3D tree detection network.
 
-Performance changes vs previous version:
-  1. AMP-ready: torch.autocast + GradScaler.
-  2. inference_mode for all purely-inferential passes.
-  3. Stage-1 scan CACHE: single PointNet++ pass per batch during training.
-  4. Vectorised _subsample_points_batch: mask built fully on GPU via scatter.
-  5. Vectorised _pad_windows_to_batch: Python loop replaced with
-     scatter_add into pre-allocated [B, max_n, 3] tensor on GPU.
-  6. _stage2_loss: Python per-proposal loop replaced with
-     _subsample_points_batch_proposals + chunked stage2 forward
-     to avoid OOM when n_positive+n_negative is large.
+Memory strategy:
+  - Stage-1: vectorised _subsample_points_batch (chunked [A_chunk x N] mask).
+  - Stage-2 training: _subsample_points_loss — pure Python loop, one proposal
+    at a time, NO [P x N] broadcast tensor ever allocated on GPU.
+    Forward through stage2 is then chunked by stage2_forward_chunk.
+  - Stage-2 inference: _subsample_points_batch_proposals — chunked broadcast,
+    safe because inference runs under torch.no_grad and smaller proposal sets.
+  - torch.cuda.empty_cache() called between stage2 forward chunks during
+    training to release fragmented blocks.
 """
 
 from __future__ import annotations
@@ -37,7 +36,7 @@ _MAX_POINTS_PER_BOX = 512
 _MIN_POINTS_FOR_NET = 4
 _ANCHOR_CHUNK       = 1024
 _STAGE1_INFER_BATCH = 64
-_STAGE2_INFER_CHUNK = 2048
+_STAGE2_INFER_CHUNK = 256   # default for inference broadcast mask
 
 
 # ---------------------------------------------------------------------------
@@ -47,6 +46,7 @@ _STAGE2_INFER_CHUNK = 2048
 def _subsample_points_in_box(
     points: Tensor, box: Tensor, n: int = _MAX_POINTS_PER_BOX
 ) -> Tensor:
+    """Sample up to n points inside a single 3-D box. CPU-friendly, no alloc."""
     x, y, z_c, w, l, h = box.unbind()
     mask = (
         (points[:, 0] >= x - w / 2) & (points[:, 0] <= x + w / 2)
@@ -59,6 +59,38 @@ def _subsample_points_in_box(
     return inside
 
 
+def _subsample_points_loss(
+    points: Tensor,
+    proposals: Tensor,
+    n: int = _MAX_POINTS_PER_BOX,
+) -> list[Tensor]:
+    """
+    Sample points for TRAINING stage-2 loss.
+
+    Uses a plain Python loop — one proposal at a time — so the maximum
+    extra GPU allocation is O(N_points) per iteration instead of
+    O(chunk * N_points) from a broadcast mask.  With N=150k and dtype=bool
+    that is 150 KB per step vs 38 MB per chunk — preventing OOM on
+    large n_pos + n_neg counts.
+    """
+    result: list[Tensor] = []
+    px = points[:, 0]
+    py = points[:, 1]
+    pz = points[:, 2]
+    for i in range(len(proposals)):
+        p = proposals[i]
+        mask = (
+            (px >= p[0] - p[3] / 2) & (px <= p[0] + p[3] / 2)
+            & (py >= p[1] - p[4] / 2) & (py <= p[1] + p[4] / 2)
+            & (pz >= 0)               & (pz <= p[5])
+        )
+        inside = points[mask]
+        if len(inside) > n:
+            inside = inside[torch.randperm(len(inside), device=points.device)[:n]]
+        result.append(inside)
+    return result
+
+
 def _subsample_points_batch(
     points: Tensor,
     anchors: Tensor,
@@ -68,8 +100,7 @@ def _subsample_points_batch(
     """
     For each anchor return up to `n` points inside its box,
     translated to anchor-local XY coordinates.
-
-    Fully vectorised on GPU: no Python loop over anchors.
+    Vectorised on GPU: builds a [chunk x N] bool mask per iteration.
     """
     device = points.device
     A      = anchors.shape[0]
@@ -144,6 +175,10 @@ def _subsample_points_batch_proposals(
     n: int     = _MAX_POINTS_PER_BOX,
     chunk: int = _STAGE2_INFER_CHUNK,
 ) -> list[Tensor]:
+    """
+    Vectorised sampling for INFERENCE (torch.no_grad context).
+    Allocates a [chunk x N] bool mask — keep chunk small (<=256).
+    """
     device = points.device
     if proposals.device != device:
         proposals = proposals.to(device)
@@ -205,12 +240,6 @@ def _pad_windows_to_batch(
     device: torch.device,
     min_pts: int = _MIN_POINTS_FOR_NET,
 ) -> tuple[Tensor, list[int]]:
-    """
-    Stack variable-length point tensors into a padded [B, max_n, 3] tensor.
-
-    Vectorised: no Python loop over windows — uses scatter_add to fill
-    the pre-allocated output tensor entirely on GPU.
-    """
     valid_idx = [i for i, p in enumerate(pts_list) if p.shape[0] >= min_pts]
     if not valid_idx:
         return torch.zeros(0, min_pts, 3, device=device), valid_idx
@@ -237,7 +266,6 @@ def _pad_windows_to_batch(
     starts  = torch.zeros(total, dtype=torch.long, device=device)
     starts[is_new] = cum[is_new]
     starts  = torch.cummax(starts, dim=0).values
-    loc_idx = cum - starts
 
     counts_t  = torch.tensor(counts, dtype=torch.long, device=device)
     reps      = (max_n + counts_t - 1) // counts_t
@@ -273,6 +301,7 @@ class TreeRCNN(nn.Module):
         self._freeze_s2_epochs: int = int(cfg.training.get("freeze_stage2_epochs", 0))
         self._current_epoch: int    = 0
         self._amp_device_type: str  = "cpu"
+        self._cuda: bool            = False
 
     def set_epoch(self, epoch: int) -> None:
         self._current_epoch = epoch
@@ -300,6 +329,7 @@ class TreeRCNN(nn.Module):
 
         device = points.device
         self._amp_device_type = device.type
+        self._cuda            = device.type == "cuda"
         pb = tuple(plot_bounds.tolist()) if isinstance(plot_bounds, Tensor) else plot_bounds
 
         t1 = time.perf_counter()
@@ -500,16 +530,17 @@ class TreeRCNN(nn.Module):
         return cls_out, reg_out
 
     # ------------------------------------------------------------------
-    # Stage 2
+    # Stage 2 — training
     # ------------------------------------------------------------------
 
     def _stage2_loss(self, points: Tensor, proposals: Tensor, gt_boxes: Tensor) -> dict:
         """
         Stage-2 training loss.
 
-        Points are sampled with _subsample_points_batch_proposals (vectorised,
-        no Python loop over proposals). The stage2 forward is then split into
-        chunks of size stage2_forward_chunk to avoid OOM on large n_pos+n_neg.
+        Point sampling uses _subsample_points_loss (per-proposal loop, no
+        [P x N] GPU broadcast).  Forward through stage2 is split into
+        chunks of size stage2_forward_chunk; empty_cache is called between
+        chunks to release CUDA memory fragments.
         """
         cfg_la = self.cfg.label_assignment
         labels, reg_targets, _, sampled = assign_targets(
@@ -527,17 +558,16 @@ class TreeRCNN(nn.Module):
         S                 = len(sampled)
         device            = points.device
 
-        # Vectorised point sampling for all sampled proposals at once
-        fwd_chunk = self._s2_fwd_chunk
-        pts_list  = _subsample_points_batch_proposals(
-            points, sampled_proposals,
-            n=_MAX_POINTS_PER_BOX,
-            chunk=fwd_chunk,
+        # Per-proposal sampling — O(N_points) alloc per step, NOT O(S * N)
+        pts_list = _subsample_points_loss(
+            points, sampled_proposals, n=_MAX_POINTS_PER_BOX
         )
 
-        # Chunked forward through stage2 to bound peak VRAM
+        # Chunked stage2 forward to keep gradient graph size bounded
+        fwd_chunk = self._s2_fwd_chunk
         all_cls: list[Tensor] = []
         all_reg: list[Tensor] = []
+
         for start in range(0, S, fwd_chunk):
             end       = min(start + fwd_chunk, S)
             chunk_pts = pts_list[start:end]
@@ -546,6 +576,9 @@ class TreeRCNN(nn.Module):
                 c, r = self.stage2(chunk_pts, chunk_prp)
             all_cls.append(c.float())
             all_reg.append(r.float())
+            # Release cached allocator blocks so next chunk starts fresh
+            if self._cuda:
+                torch.cuda.empty_cache()
 
         cls_logits = torch.cat(all_cls, dim=0)  # (S, 1)
         reg_deltas = torch.cat(all_reg, dim=0)  # (S, 6)
@@ -562,6 +595,10 @@ class TreeRCNN(nn.Module):
         total = cls_loss + self.lambda_reg * reg_loss
         return {"loss_stage2_cls": cls_loss, "loss_stage2_reg": reg_loss,
                 "total_loss_stage2": total}
+
+    # ------------------------------------------------------------------
+    # Stage 2 — inference
+    # ------------------------------------------------------------------
 
     def _stage2_inference(self, points: Tensor, proposals: Tensor):
         cfg_nms  = self.cfg.stage2_nms
