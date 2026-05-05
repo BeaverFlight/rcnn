@@ -4,43 +4,41 @@ TreeRCNN inference on a single .las / .laz file.
 Supports full large point clouds via sliding-window tiling:
   each tile is processed independently, then results are merged with global NMS.
 
+DEM is optional:
+  - If --dem is given, heights are normalised using the external raster.
+  - If omitted, a DEM is estimated from classification=2 (ground) points
+    inside the LAS file itself via bilinear-interpolated raster.
+
 Outputs (in --out_dir):
-  trees.csv       — x, y, height_m, score, tile_id
-  trees.geojson   — GeoJSON FeatureCollection (same data, for QGIS / GIS tools)
+  trees.csv       — x, y, height_m, score
+  trees.geojson   — GeoJSON FeatureCollection (for QGIS / GIS tools)
 
 Usage:
-  # minimal — DEM required for proper height normalisation
+  # with external DEM
   python predict.py \\
-      --config  configs/tree_rcnn_auto.yaml \\
-      --ckpt    outputs/fold_0/best.pth \\
-      --las     data/forest.las \\
-      --dem     data/dem.asc
+      --config configs/tree_rcnn_auto.yaml \\
+      --ckpt   outputs/fold_0/best.pth \\
+      --las    data/forest.las \\
+      --dem    data/dem.asc
 
-  # with all options
+  # DEM from LAS ground points (classification=2)
+  python predict.py \\
+      --config configs/tree_rcnn_auto.yaml \\
+      --ckpt   outputs/fold_0/best.pth \\
+      --las    data/forest.las
+
+  # all options
   python predict.py \\
       --config           configs/tree_rcnn_auto.yaml \\
       --ckpt             outputs/fold_0/best.pth \\
       --las              data/forest.las \\
-      --dem              data/dem.asc \\
       --out_dir          results/ \\
       --tile_size        100 \\
       --tile_overlap     15 \\
       --score_threshold  0.5 \\
       --max_points_tile  200000 \\
+      --dem_resolution   0.5 \\
       --seed             42
-
-CLI arguments:
-  --config           Path to OmegaConf YAML config (required)
-  --ckpt             Path to .pth checkpoint (required)
-  --las              Input .las / .laz file (required)
-  --dem              Path to DEM raster .asc / .tif (required for accurate heights)
-  --out_dir          Output directory [default: results/]
-  --tile_size        Tile side length in metres [default: 120]
-  --tile_overlap     Overlap between adjacent tiles in metres [default: 15]
-  --score_threshold  Override stage2_nms.score_threshold from config
-  --max_points_tile  Max points per tile sent to the model [default: 250000]
-  --seed             Random seed [default: 42]
-  --no_amp           Disable AMP even on CUDA
 """
 
 from __future__ import annotations
@@ -50,7 +48,7 @@ import csv
 import json
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -76,18 +74,85 @@ logger = logging.getLogger("predict")
 
 
 # ---------------------------------------------------------------------------
+# DEM from LAS ground points (classification == 2)
+# ---------------------------------------------------------------------------
+
+def _dem_from_las_ground(
+    las_path: Path,
+    resolution: float = 0.5,
+) -> tuple[np.ndarray, float, float, float]:
+    """
+    Build a DEM raster from LAS classification=2 (ground) points.
+
+    Returns:
+        dem        — 2D float32 array (rows=y, cols=x)
+        x_orig     — left edge of raster
+        y_orig     — bottom edge of raster
+        resolution — cell size in metres (same as input)
+    """
+    import laspy
+
+    with laspy.open(str(las_path)) as f:
+        las = f.read()
+
+    classification = np.array(las.classification, dtype=np.uint8)
+    ground_mask    = classification == 2
+
+    if ground_mask.sum() < 10:
+        raise RuntimeError(
+            f"Less than 10 ground points (class=2) found in {las_path}. "
+            "Provide an external DEM with --dem."
+        )
+
+    x = np.array(las.x, dtype=np.float64)[ground_mask]
+    y = np.array(las.y, dtype=np.float64)[ground_mask]
+    z = np.array(las.z, dtype=np.float64)[ground_mask]
+
+    x_orig = x.min()
+    y_orig = y.min()
+
+    cols = int(np.ceil((x.max() - x_orig) / resolution)) + 1
+    rows = int(np.ceil((y.max() - y_orig) / resolution)) + 1
+
+    dem_sum = np.zeros((rows, cols), dtype=np.float64)
+    dem_cnt = np.zeros((rows, cols), dtype=np.int32)
+
+    ci = np.floor((x - x_orig) / resolution).astype(int)
+    ri = np.floor((y - y_orig) / resolution).astype(int)
+    ci = np.clip(ci, 0, cols - 1)
+    ri = np.clip(ri, 0, rows - 1)
+
+    np.add.at(dem_sum, (ri, ci), z)
+    np.add.at(dem_cnt, (ri, ci), 1)
+
+    # Cells with no ground points: fill with nearest neighbour
+    dem = np.where(dem_cnt > 0, dem_sum / dem_cnt, np.nan).astype(np.float32)
+    nan_mask = np.isnan(dem)
+    if nan_mask.any():
+        from scipy.ndimage import distance_transform_edt
+        _, idx = distance_transform_edt(nan_mask, return_indices=True)
+        dem[nan_mask] = dem[idx[0][nan_mask], idx[1][nan_mask]]
+
+    logger.info(
+        "DEM from ground points: %d pts → %dx%d raster (res=%.2fm)",
+        ground_mask.sum(), rows, cols, resolution,
+    )
+    return dem, float(x_orig), float(y_orig), float(resolution)
+
+
+# ---------------------------------------------------------------------------
 # Tile helpers
 # ---------------------------------------------------------------------------
 
 @dataclass
 class Tile:
-    idx:    int
-    x_min:  float
-    y_min:  float
-    x_max:  float
-    y_max:  float
-    points: np.ndarray          # (N, 3) already height-normalised
-    local_maxima: np.ndarray    # (K, 3)
+    idx:         int
+    x_min:       float
+    y_min:       float
+    x_max:       float
+    y_max:       float
+    points:      np.ndarray      # (N, 3) height-normalised
+    local_maxima: np.ndarray     # (K, 3)
 
 
 def _build_tiles(
@@ -95,12 +160,10 @@ def _build_tiles(
     tile_size: float,
     overlap: float,
 ) -> list[tuple[float, float, float, float]]:
-    """Return list of (x_min, y_min, x_max, y_max) tile bounds with overlap."""
-    x_min_g, y_min_g = points[:, 0].min(), points[:, 1].min()
-    x_max_g, y_max_g = points[:, 0].max(), points[:, 1].max()
-
+    x_min_g, y_min_g = float(points[:, 0].min()), float(points[:, 1].min())
+    x_max_g, y_max_g = float(points[:, 0].max()), float(points[:, 1].max())
     stride = tile_size - overlap
-    tiles  = []
+    tiles: list[tuple[float, float, float, float]] = []
     y = y_min_g
     while y < y_max_g:
         x = x_min_g
@@ -117,7 +180,6 @@ def _make_tile(
     points: np.ndarray,
     cfg,
 ) -> Tile | None:
-    """Extract points for one tile and compute local maxima."""
     x_min, y_min, x_max, y_max = bounds
     mask = (
         (points[:, 0] >= x_min) & (points[:, 0] < x_max) &
@@ -126,7 +188,6 @@ def _make_tile(
     pts = points[mask]
     if len(pts) < 10:
         return None
-
     chm, chm_x, chm_y = generate_chm(
         pts,
         resolution=cfg.preprocessing.chm_resolution,
@@ -158,22 +219,16 @@ def _infer_tile(
     max_points: int,
     amp_enabled: bool,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    Run full TreeRCNN inference on one tile.
-    Returns (boxes_np [K,6], scores_np [K]).
-    """
     pts = tile.points
     if len(pts) > max_points:
         idx = np.random.choice(len(pts), max_points, replace=False)
         pts = pts[idx]
 
     plot_bounds = (tile.x_min, tile.y_min, tile.x_max, tile.y_max)
+    points_t    = torch.from_numpy(pts).float().to(device)
+    maxima_t    = torch.from_numpy(tile.local_maxima).float().to(device)
+    gt_dummy    = torch.zeros(0, 6, device=device)
 
-    points_t  = torch.from_numpy(pts).float().to(device)
-    maxima_t  = torch.from_numpy(tile.local_maxima).float().to(device)
-    gt_dummy  = torch.zeros(0, 6, device=device)
-
-    # Override score threshold for this run
     orig_thr = float(model.cfg.stage2_nms.score_threshold)
     model.cfg.stage2_nms.score_threshold = score_threshold
 
@@ -189,8 +244,7 @@ def _infer_tile(
 
 
 # ---------------------------------------------------------------------------
-# Merge tiles: keep only detections in the non-overlapping "core" of each tile,
-# then run global NMS to clean up boundary duplicates.
+# Merge tiles + global NMS
 # ---------------------------------------------------------------------------
 
 def _merge_tiles(
@@ -201,10 +255,6 @@ def _merge_tiles(
     iouv_thr:   float,
     device:     torch.device,
 ) -> tuple[np.ndarray, np.ndarray]:
-    """
-    1. Filter each tile's detections to its core (inset by overlap/2).
-    2. Concatenate and run global NMS.
-    """
     core_boxes:  list[np.ndarray] = []
     core_scores: list[np.ndarray] = []
     half = overlap / 2.0
@@ -212,8 +262,7 @@ def _merge_tiles(
     for tile, boxes, scores in zip(tiles, all_boxes, all_scores):
         if len(boxes) == 0:
             continue
-        cx = boxes[:, 0]
-        cy = boxes[:, 1]
+        cx, cy = boxes[:, 0], boxes[:, 1]
         in_core = (
             (cx >= tile.x_min + half) & (cx < tile.x_max - half) &
             (cy >= tile.y_min + half) & (cy < tile.y_max - half)
@@ -226,10 +275,9 @@ def _merge_tiles(
 
     all_b = np.concatenate(core_boxes,  axis=0)
     all_s = np.concatenate(core_scores, axis=0)
-
-    b_t = torch.from_numpy(all_b).float().to(device)
-    s_t = torch.from_numpy(all_s).float().to(device)
-    keep = nms3d(b_t, s_t, iouv_thr)
+    b_t   = torch.from_numpy(all_b).float().to(device)
+    s_t   = torch.from_numpy(all_s).float().to(device)
+    keep  = nms3d(b_t, s_t, iouv_thr)
     keep_np = keep.cpu().numpy()
     return all_b[keep_np], all_s[keep_np]
 
@@ -248,13 +296,12 @@ def _save_csv(trees: np.ndarray, scores: np.ndarray, path: Path) -> None:
                 round(float(x), 3), round(float(y), 3),
                 round(float(h), 3), round(float(s), 4),
             ])
-    logger.info("Saved %d trees → %s", len(trees), path)
+    logger.info("Saved %d trees \u2192 %s", len(trees), path)
 
 
 def _save_geojson(trees: np.ndarray, scores: np.ndarray, path: Path) -> None:
-    features = []
-    for (x, y, h), s in zip(trees, scores):
-        features.append({
+    features = [
+        {
             "type": "Feature",
             "geometry": {
                 "type": "Point",
@@ -264,12 +311,13 @@ def _save_geojson(trees: np.ndarray, scores: np.ndarray, path: Path) -> None:
                 "height_m": round(float(h), 3),
                 "score":    round(float(s), 4),
             },
-        })
+        }
+        for (x, y, h), s in zip(trees, scores)
+    ]
     path.write_text(json.dumps(
-        {"type": "FeatureCollection", "features": features},
-        indent=2,
+        {"type": "FeatureCollection", "features": features}, indent=2
     ))
-    logger.info("Saved GeoJSON → %s", path)
+    logger.info("Saved GeoJSON \u2192 %s", path)
 
 
 # ---------------------------------------------------------------------------
@@ -278,25 +326,23 @@ def _save_geojson(trees: np.ndarray, scores: np.ndarray, path: Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="TreeRCNN inference on .las/.laz file with sliding-window tiling"
+        description="TreeRCNN inference with sliding-window tiling"
     )
     parser.add_argument("--config",           required=True)
     parser.add_argument("--ckpt",             required=True)
     parser.add_argument("--las",              required=True)
-    parser.add_argument("--dem",              required=True,
-                        help="Path to DEM raster (.asc or .tif)")
+    parser.add_argument("--dem",              default=None,
+                        help="DEM raster (.asc/.tif). Omit to build DEM from "
+                             "LAS classification=2 (ground) points.")
+    parser.add_argument("--dem_resolution",   type=float, default=0.5,
+                        help="Cell size in metres for auto-DEM [0.5]")
     parser.add_argument("--out_dir",          default="results/")
-    parser.add_argument("--tile_size",        type=float, default=120.0,
-                        help="Tile side length in metres [120]")
-    parser.add_argument("--tile_overlap",     type=float, default=15.0,
-                        help="Overlap between tiles in metres [15]")
-    parser.add_argument("--score_threshold",  type=float, default=None,
-                        help="Override stage2_nms.score_threshold")
-    parser.add_argument("--max_points_tile",  type=int,   default=250_000,
-                        help="Max points per tile sent to model [250000]")
+    parser.add_argument("--tile_size",        type=float, default=120.0)
+    parser.add_argument("--tile_overlap",     type=float, default=15.0)
+    parser.add_argument("--score_threshold",  type=float, default=None)
+    parser.add_argument("--max_points_tile",  type=int,   default=250_000)
     parser.add_argument("--seed",             type=int,   default=42)
-    parser.add_argument("--no_amp",           action="store_true",
-                        help="Disable AMP (autocast) even on CUDA")
+    parser.add_argument("--no_amp",           action="store_true")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -310,7 +356,7 @@ def main() -> None:
                 else float(cfg.stage2_nms.score_threshold)
     logger.info("Score threshold: %.2f", score_thr)
 
-    # ── Load model ──────────────────────────────────────────────────────────
+    # ── Load model ─────────────────────────────────────────────────────────
     model = TreeRCNN(cfg).to(device)
     ckpt  = torch.load(args.ckpt, map_location=device, weights_only=False)
 
@@ -320,26 +366,37 @@ def main() -> None:
     if unexpected:
         logger.warning("Unexpected keys (%d): %s", len(unexpected), unexpected)
 
+    # If checkpoint contains config, log it for reference
+    if "cfg" in ckpt:
+        logger.info("Checkpoint trained with config: %s",
+                    json.dumps(ckpt["cfg"], ensure_ascii=False))
+
     model.eval()
-    model.set_epoch(9999)   # ensure stage2 is unfrozen
+    model.set_epoch(9999)  # ensure stage2 is unfrozen
     logger.info("Loaded checkpoint %s  (epoch %s)", args.ckpt, ckpt.get("epoch", "?"))
 
-    # ── Load & preprocess full point cloud ──────────────────────────────────
+    # ── Load raw point cloud ───────────────────────────────────────────────
     t0 = time.perf_counter()
     logger.info("Loading LAS: %s", args.las)
     raw_points = load_las_file(Path(args.las))
 
-    logger.info("Loading DEM: %s", args.dem)
-    dem, dem_x, dem_y, dem_res = load_dem_asc(Path(args.dem))
+    # ── DEM: external file or auto from ground points ──────────────────────
+    if args.dem is not None:
+        logger.info("Loading DEM from file: %s", args.dem)
+        dem, dem_x, dem_y, dem_res = load_dem_asc(Path(args.dem))
+    else:
+        logger.info("Building DEM from LAS ground points (class=2) …")
+        dem, dem_x, dem_y, dem_res = _dem_from_las_ground(
+            Path(args.las), resolution=args.dem_resolution
+        )
 
+    # ── Height normalisation & filter ───────────────────────────────────
     logger.info("Normalising heights")
     points = normalize_heights(raw_points, dem, dem_x, dem_y, dem_res)
-
-    # Filter low vegetation
     min_h  = float(cfg.preprocessing.min_height)
     points = points[points[:, 2] >= min_h]
-    logger.info("Points after height filter: %d  (%.1fs)", len(points),
-                time.perf_counter() - t0)
+    logger.info("Points after height filter: %d  (%.1fs)",
+                len(points), time.perf_counter() - t0)
 
     # ── Build tiles ─────────────────────────────────────────────────────────
     tile_bounds = _build_tiles(points, args.tile_size, args.tile_overlap)
@@ -351,7 +408,6 @@ def main() -> None:
         tile = _make_tile(i, bounds, points, cfg)
         if tile is not None:
             tiles.append(tile)
-
     logger.info("Non-empty tiles: %d / %d", len(tiles), len(tile_bounds))
 
     # ── Per-tile inference ──────────────────────────────────────────────────
@@ -362,29 +418,29 @@ def main() -> None:
         t_tile = time.perf_counter()
         logger.info("Tile %d/%d  pts=%d  maxima=%d",
                     tile.idx + 1, len(tiles), len(tile.points), len(tile.local_maxima))
-
         boxes, scores = _infer_tile(
             tile, model, device, score_thr, args.max_points_tile, amp_enabled
         )
         all_boxes.append(boxes)
         all_scores.append(scores)
-        logger.info("  → %d detections  (%.2fs)", len(boxes),
+        logger.info("  \u2192 %d detections  (%.2fs)", len(boxes),
                     time.perf_counter() - t_tile)
 
     # ── Merge & global NMS ──────────────────────────────────────────────────
     logger.info("Merging tiles with global NMS …")
-    iouv_thr   = float(cfg.stage2_nms.iouv_threshold)
+    iouv_thr = float(cfg.stage2_nms.iouv_threshold)
     final_boxes, final_scores = _merge_tiles(
         all_boxes, all_scores, tiles, args.tile_overlap, iouv_thr, device
     )
     logger.info("After merge + NMS: %d trees  (total %.1fs)",
                 len(final_boxes), time.perf_counter() - t0)
 
-    # ── Extract apex XYZ ────────────────────────────────────────────────────
-    if len(final_boxes) > 0:
-        trees_xyz = extract_tree_positions(final_boxes, points)
-    else:
-        trees_xyz = np.zeros((0, 3), dtype=np.float32)
+    # ── Extract apex XYZ ───────────────────────────────────────────────────
+    trees_xyz = (
+        extract_tree_positions(final_boxes, points)
+        if len(final_boxes) > 0
+        else np.zeros((0, 3), dtype=np.float32)
+    )
 
     # ── Save ────────────────────────────────────────────────────────────────
     out_dir = Path(args.out_dir)

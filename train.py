@@ -14,6 +14,8 @@ Performance additions:
   - torch.set_num_threads / set_num_interop_threads configured at startup
     so that OpenMP-backed CPU ops (anchor generation, assign_targets)
     use multiple cores without GIL contention.
+
+JSON output per val epoch now includes full training config under key 'config'.
 """
 
 from __future__ import annotations
@@ -300,6 +302,9 @@ def train_fold(
     if freeze_s2_epochs > 0:
         logger.info("Two-phase: Stage-2 frozen for first %d epochs.", freeze_s2_epochs)
 
+    # Serialise cfg once — reused in every JSON write
+    cfg_dict = OmegaConf.to_container(cfg, resolve=True)
+
     for epoch in range(start_epoch, cfg.training.epochs):
         model.set_epoch(epoch)
         model.train()
@@ -369,6 +374,7 @@ def train_fold(
             info["epoch"]      = epoch + 1
             info["fold"]       = fold_idx
             info["train_loss"] = round(float(mean_loss), 6)
+            info["config"]     = cfg_dict          # <-- full training config
 
             epoch_ckpt = ckpt_dir / f"epoch_{epoch + 1:04d}.pth"
             epoch_json = ckpt_dir / f"epoch_{epoch + 1:04d}.json"
@@ -384,7 +390,7 @@ def train_fold(
                 best_score = score
                 shutil.copy2(epoch_ckpt, ckpt_dir / "best.pth")
                 shutil.copy2(epoch_json, ckpt_dir / "best.json")
-                logger.info("  ★ New best! F1=%.4f — best.pth", best_score)
+                logger.info("  \u2605 New best! F1=%.4f — best.pth", best_score)
 
             model.train()
 
