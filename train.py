@@ -81,6 +81,19 @@ def _configure_cpu_threads(cfg) -> None:
     logger.info("CPU threads: intra_op=%d  inter_op=%d", intra, inter)
 
 
+def _log_vram(label: str) -> None:
+    """Log current and peak VRAM usage. No-op if CUDA is not available."""
+    if not torch.cuda.is_available():
+        return
+    alloc   = torch.cuda.memory_allocated()  / 1024**3
+    reserved = torch.cuda.memory_reserved() / 1024**3
+    total   = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    logger.info(
+        "VRAM [%s]: alloc=%.2f GB  reserved=%.2f GB  total=%.2f GB  (alloc %.0f%%)",
+        label, alloc, reserved, total, alloc / total * 100,
+    )
+
+
 def _f1_score(matched: int, detected: int, reference: int) -> float:
     if detected == 0 and reference == 0:
         return 0.0
@@ -328,10 +341,20 @@ def train_fold(
             gt_boxes     = gt_boxes.to(device, non_blocking=True)
             local_maxima = local_maxima.to(device, non_blocking=True)
 
+            # --- диагностика VRAM и размера сэмпла перед forward ---
+            logger.info(
+                "Batch e%d/b%d: points=%d  gt_boxes=%d",
+                epoch + 1, batch_idx + 1,
+                points.shape[0], gt_boxes.shape[0],
+            )
+            _log_vram(f"e{epoch+1}/b{batch_idx+1} pre-forward")
+
             optimizer.zero_grad(set_to_none=True)
 
             loss_dict  = model(points, gt_boxes, local_maxima, plot_bounds, training=True)
             total_loss = loss_dict["total_loss"]
+
+            _log_vram(f"e{epoch+1}/b{batch_idx+1} post-forward")
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 nan_batches += 1
