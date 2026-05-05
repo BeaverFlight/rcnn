@@ -14,6 +14,8 @@ Performance additions:
   - torch.set_num_threads / set_num_interop_threads configured at startup
     so that OpenMP-backed CPU ops (anchor generation, assign_targets)
     use multiple cores without GIL contention.
+  - torch.cuda.empty_cache() after backward+step — освобождает кэш CUDA
+    аллокатора между батчами, предотвращает рост reserved VRAM и OOM.
 
 JSON output per val epoch now includes full training config under key 'config'.
 """
@@ -85,9 +87,9 @@ def _log_vram(label: str) -> None:
     """Log current and peak VRAM usage. No-op if CUDA is not available."""
     if not torch.cuda.is_available():
         return
-    alloc   = torch.cuda.memory_allocated()  / 1024**3
-    reserved = torch.cuda.memory_reserved() / 1024**3
-    total   = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    alloc    = torch.cuda.memory_allocated()  / 1024**3
+    reserved = torch.cuda.memory_reserved()   / 1024**3
+    total    = torch.cuda.get_device_properties(0).total_memory / 1024**3
     logger.info(
         "VRAM [%s]: alloc=%.2f GB  reserved=%.2f GB  total=%.2f GB  (alloc %.0f%%)",
         label, alloc, reserved, total, alloc / total * 100,
@@ -312,6 +314,7 @@ def train_fold(
     max_grad_norm: float = cfg.training.get("max_grad_norm", 1.0)
     ckpt_interval: int   = cfg.training.get("checkpoint_interval", 10)
     freeze_s2_epochs: int = cfg.training.get("freeze_stage2_epochs", 0)
+    is_cuda: bool = device.type == "cuda"
     if freeze_s2_epochs > 0:
         logger.info("Two-phase: Stage-2 frozen for first %d epochs.", freeze_s2_epochs)
 
@@ -341,7 +344,8 @@ def train_fold(
             gt_boxes     = gt_boxes.to(device, non_blocking=True)
             local_maxima = local_maxima.to(device, non_blocking=True)
 
-            # --- диагностика VRAM и размера сэмпла перед forward ---
+            # Правильное логирование: points — (N, 3), gt_boxes — (G, 6).
+            # points.shape[0] — число точек; gt_boxes.shape[0] — число деревьев.
             logger.info(
                 "Batch e%d/b%d: points=%d  gt_boxes=%d",
                 epoch + 1, batch_idx + 1,
@@ -368,6 +372,12 @@ def train_fold(
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
+
+            # Освобождаем кэш CUDA-аллокатора после backward+step.
+            # Без этого reserved VRAM не возвращается OS и накапливается от батча к батчу,
+            # что приводит к OOM при пиках stage1/stage2 forward следующего батча.
+            if is_cuda:
+                torch.cuda.empty_cache()
 
             epoch_losses.append(total_loss.item())
 
