@@ -11,6 +11,9 @@ Performance additions:
     Controlled by cfg.training.amp (default True for cuda).
   - GradScaler handles fp16 underflow; disabled on CPU automatically.
   - Checkpoint saves/restores scaler state for seamless resume.
+  - torch.set_num_threads / set_num_interop_threads configured at startup
+    so that OpenMP-backed CPU ops (anchor generation, assign_targets)
+    use multiple cores without GIL contention.
 """
 
 from __future__ import annotations
@@ -54,6 +57,26 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def _configure_cpu_threads(cfg) -> None:
+    """
+    Set PyTorch intra/inter-op thread counts for CPU operations.
+
+    - intra_op  (set_num_threads):        controls OpenMP parallelism inside
+      a single op, e.g. matrix multiply, anchor generation numpy loops.
+    - inter_op  (set_num_interop_threads): controls how many independent ops
+      PyTorch may run in parallel (useful when multiple CPU ops are queued).
+
+    Defaults: 6 intra / 2 inter — leaves 2 physical cores free for the
+    DataLoader workers and OS, avoiding contention on a typical 8-core CPU.
+    Override via cfg.training.cpu_threads / cfg.training.cpu_interop_threads.
+    """
+    intra = int(cfg.training.get("cpu_threads",        6))
+    inter = int(cfg.training.get("cpu_interop_threads", 2))
+    torch.set_num_threads(intra)
+    torch.set_num_interop_threads(inter)
+    logger.info("CPU threads: intra_op=%d  inter_op=%d", intra, inter)
 
 
 def _f1_score(matched: int, detected: int, reference: int) -> float:
@@ -138,18 +161,16 @@ def load_checkpoint(
 ) -> tuple[int, float]:
     ckpt = torch.load(str(path), map_location=device)
 
-    missing, unexpected = model.load_state_dict(
-        ckpt["model_state_dict"], strict=False
-    )
+    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if missing:
-        logger.warning("load_checkpoint: %d missing keys (re-init): %s", len(missing), missing)
+        logger.warning("load_checkpoint: %d missing keys: %s", len(missing), missing)
     if unexpected:
-        logger.warning("load_checkpoint: %d unexpected keys (ignored): %s", len(unexpected), unexpected)
+        logger.warning("load_checkpoint: %d unexpected keys: %s", len(unexpected), unexpected)
 
     try:
         optimizer.load_state_dict(ckpt["optimizer_state_dict"])
     except (ValueError, KeyError) as exc:
-        logger.warning("load_checkpoint: optimizer state incompatible (%s) — fresh start.", exc)
+        logger.warning("load_checkpoint: optimizer incompatible (%s) — fresh start.", exc)
 
     if scaler is not None and "scaler_state_dict" in ckpt:
         scaler.load_state_dict(ckpt["scaler_state_dict"])
@@ -180,10 +201,8 @@ def _evaluate_fold(
             plot_bounds  = sample["plot_bounds"]
             plot_id      = sample["plot_id"]
 
-            logger.info(
-                "Val plot %d: %d points, %d GT trees — inference...",
-                plot_id, len(points), len(gt_boxes),
-            )
+            logger.info("Val plot %d: %d points, %d GT trees — inference...",
+                        plot_id, len(points), len(gt_boxes))
             t_plot = time.perf_counter()
             out    = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
             logger.info("Val plot %d: %.2fs, boxes=%d",
@@ -224,26 +243,17 @@ def train_fold(
 
     logger.info("=== Fold %d | Train: %s | Val: %s ===", fold_idx, train_ids, val_ids)
 
-    train_ds = NewforDataset(
-        data_root, train_ids, cfg,
-        augment_data=True,
-        max_points=cfg.training.max_points,
-    )
+    train_ds = NewforDataset(data_root, train_ids, cfg, augment_data=True,
+                             max_points=cfg.training.max_points)
     val_max_points: int = cfg.training.get("val_max_points", 200_000)
-    val_ds = NewforDataset(
-        data_root, val_ids, cfg,
-        augment_data=False,
-        max_points=val_max_points,
-    )
+    val_ds = NewforDataset(data_root, val_ids, cfg, augment_data=False,
+                           max_points=val_max_points)
     logger.info("Val dataset: %d plots, val_max_points=%d", len(val_ds), val_max_points)
 
     num_workers: int = cfg.training.get("num_workers", 0)
     train_loader = DataLoader(
-        train_ds,
-        batch_size=cfg.training.batch_size,
-        shuffle=True,
-        collate_fn=collate_tree_rcnn,
-        num_workers=num_workers,
+        train_ds, batch_size=cfg.training.batch_size, shuffle=True,
+        collate_fn=collate_tree_rcnn, num_workers=num_workers,
         pin_memory=(num_workers > 0 and device.type == "cuda"),
     )
 
@@ -266,15 +276,7 @@ def train_fold(
         optimizer, T_max=cfg.training.epochs, eta_min=lr * 0.1,
     )
 
-    # ------------------------------------------------------------------
-    # AMP: use new torch.amp.GradScaler API (torch.cuda.amp.GradScaler
-    # was deprecated in PyTorch 2.3).
-    # Disabled automatically on CPU — GradScaler requires device_type='cuda'.
-    # ------------------------------------------------------------------
-    use_amp: bool = (
-        device.type == "cuda"
-        and bool(cfg.training.get("amp", True))
-    )
+    use_amp: bool = (device.type == "cuda" and bool(cfg.training.get("amp", True)))
     scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     if use_amp:
         logger.info("AMP enabled (autocast + GradScaler).")
@@ -286,18 +288,14 @@ def train_fold(
 
     best_score  = 0.0
     start_epoch = 0
-
     resume = ckpt_dir / "latest.pth"
     if resume.exists():
-        start_epoch, best_score = load_checkpoint(
-            model, optimizer, resume, device, scaler=scaler
-        )
+        start_epoch, best_score = load_checkpoint(model, optimizer, resume, device, scaler=scaler)
 
     val_interval:  int   = cfg.training.get("val_interval",  10)
     log_interval:  int   = cfg.training.get("log_interval",  3)
     max_grad_norm: float = cfg.training.get("max_grad_norm", 1.0)
     ckpt_interval: int   = cfg.training.get("checkpoint_interval", 10)
-
     freeze_s2_epochs: int = cfg.training.get("freeze_stage2_epochs", 0)
     if freeze_s2_epochs > 0:
         logger.info("Two-phase: Stage-2 frozen for first %d epochs.", freeze_s2_epochs)
@@ -328,14 +326,12 @@ def train_fold(
             optimizer.zero_grad(set_to_none=True)
 
             loss_dict  = model(points, gt_boxes, local_maxima, plot_bounds, training=True)
-            total_loss: torch.Tensor = loss_dict["total_loss"]
+            total_loss = loss_dict["total_loss"]
 
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 nan_batches += 1
-                logger.warning(
-                    "Epoch %d, batch %d: NaN/Inf loss — skipped (%d total)",
-                    epoch + 1, batch_idx, nan_batches,
-                )
+                logger.warning("Epoch %d, batch %d: NaN/Inf loss — skipped (%d total)",
+                                epoch + 1, batch_idx, nan_batches)
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
@@ -349,35 +345,25 @@ def train_fold(
 
             if (batch_idx + 1) % log_interval == 0:
                 recent = np.mean(epoch_losses[-log_interval:])
-                logger.info(
-                    "Epoch %d | Batch %d | Loss: %.4f | LR: %.2e | scale: %.0f",
-                    epoch + 1, batch_idx + 1, recent,
-                    optimizer.param_groups[0]["lr"],
-                    scaler.get_scale(),
-                )
+                logger.info("Epoch %d | Batch %d | Loss: %.4f | LR: %.2e | scale: %.0f",
+                            epoch + 1, batch_idx + 1, recent,
+                            optimizer.param_groups[0]["lr"], scaler.get_scale())
 
         scheduler.step()
-
         mean_loss = np.mean(epoch_losses) if epoch_losses else float("nan")
-        logger.info(
-            "Epoch %d/%d | Loss: %.4f | NaN: %d | LR: %.2e",
-            epoch + 1, cfg.training.epochs, mean_loss, nan_batches,
-            optimizer.param_groups[0]["lr"],
-        )
+        logger.info("Epoch %d/%d | Loss: %.4f | NaN: %d | LR: %.2e",
+                    epoch + 1, cfg.training.epochs, mean_loss, nan_batches,
+                    optimizer.param_groups[0]["lr"])
 
         if (epoch + 1) % ckpt_interval == 0:
-            save_checkpoint(
-                model, optimizer, epoch + 1, best_score,
-                ckpt_dir / "latest.pth", cfg=cfg, scaler=scaler,
-            )
+            save_checkpoint(model, optimizer, epoch + 1, best_score,
+                            ckpt_dir / "latest.pth", cfg=cfg, scaler=scaler)
 
         if (epoch + 1) % val_interval == 0 and len(val_ds) > 0:
             logger.info("--- Val (epoch %d, %d plots) ---", epoch + 1, len(val_ds))
             t_val = time.perf_counter()
-
             plot_metrics = _evaluate_fold(model, val_ds, cfg, device)
             score, info  = _quality_score(plot_metrics)
-
             logger.info("--- Val done in %.2fs ---", time.perf_counter() - t_val)
 
             info["epoch"]      = epoch + 1
@@ -390,19 +376,14 @@ def train_fold(
                             epoch_ckpt, cfg=cfg, scaler=scaler)
             epoch_json.write_text(json.dumps(info, indent=2, ensure_ascii=False))
 
-            logger.info(
-                "Fold %d | Epoch %d | F1=%.4f P=%.4f R=%.4f det=%d ref=%d match=%d",
-                fold_idx, epoch + 1,
-                info["f1"], info["precision"], info["recall"],
-                info["total_detected"], info["total_reference"], info["total_matched"],
-            )
+            logger.info("Fold %d | Epoch %d | F1=%.4f P=%.4f R=%.4f det=%d ref=%d match=%d",
+                        fold_idx, epoch + 1, info["f1"], info["precision"], info["recall"],
+                        info["total_detected"], info["total_reference"], info["total_matched"])
 
             if score > best_score:
                 best_score = score
-                best_ckpt  = ckpt_dir / "best.pth"
-                best_json  = ckpt_dir / "best.json"
-                shutil.copy2(epoch_ckpt, best_ckpt)
-                shutil.copy2(epoch_json, best_json)
+                shutil.copy2(epoch_ckpt, ckpt_dir / "best.pth")
+                shutil.copy2(epoch_json, ckpt_dir / "best.json")
                 logger.info("  ★ New best! F1=%.4f — best.pth", best_score)
 
             model.train()
@@ -419,8 +400,7 @@ def main() -> None:
     parser.add_argument("--config",    default="configs/tree_rcnn.yaml")
     parser.add_argument("--data_root", required=True)
     parser.add_argument("--out_dir",   default="outputs/")
-    parser.add_argument("--fold",      type=int, default=None,
-                        help="Single fold (0-indexed); default: all")
+    parser.add_argument("--fold",      type=int, default=None)
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -428,6 +408,8 @@ def main() -> None:
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     logger.info("Device: %s", device)
+
+    _configure_cpu_threads(cfg)
 
     data_root = Path(args.data_root)
     out_dir   = Path(args.out_dir)
