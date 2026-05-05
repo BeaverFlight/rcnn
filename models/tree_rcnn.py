@@ -12,10 +12,13 @@ Memory strategy:
          chunk_pts = [p.to(device) for p in pts_list[start:end]]
          Пиковая VRAM = chunk_size * max_pts * 3 * fp16 = ~1.5 MB при chunk=256.
       5. torch.cuda.empty_cache() между чанками.
-  - Stage-2 inference: _subsample_points_batch_proposals — chunked broadcast,
-    безопасен под torch.inference_mode и меньших proposal наборах.
-  - _stage1_loss_with_cache: явный del исходных тензоров с grad-графом
-    сразу после .detach().clone() — освобождает граф до clone.
+  - Stage-2 inference (_subsample_points_batch_proposals):
+      - явный del mask + empty_cache() в конце каждой итерации —
+        исключает накопление [chunk x N] bool тензоров (до 64 MB/чанк).
+  - _pad_windows_to_batch: явный del tiled_parts после torch.stack —
+    исключает одновременное хранение списка и батча (пик 2×B×max_n×3×dtype).
+  - _stage1_loss_with_cache: явный del all_cls/all_reg после сборки cache —
+    освобождает логиты сразу как cache уже содержит декодированные боксы.
 """
 
 from __future__ import annotations
@@ -187,6 +190,10 @@ def _subsample_points_batch_proposals(
     Vectorised GPU sampling for stage-2 INFERENCE.
     Safe under torch.inference_mode — no grad graph, smaller proposal sets.
     Builds a [chunk x N] bool mask per iteration.
+
+    Memory fix: явный del mask + empty_cache() в конце каждой итерации.
+    Без этого [chunk x N] bool (до 64 MB при chunk=256, N=250k) накапливался
+    до следующего GC-цикла Python.
     """
     device = points.device
     if proposals.device != device:
@@ -224,6 +231,10 @@ def _subsample_points_batch_proposals(
         _, point_idx = mask.nonzero(as_tuple=True)
         groups       = torch.split(point_idx, counts.tolist())
 
+        # явный del mask — освобождаем [chunk x N] bool немедленно,
+        # не ждём следующей итерации / GC
+        del mask
+
         non_empty = total_kept = 0
         for i, grp in enumerate(groups):
             if len(grp) == 0:
@@ -234,6 +245,9 @@ def _subsample_points_batch_proposals(
                 grp = grp[torch.randperm(len(grp), device=device)[:n]]
             total_kept        += len(grp)
             result[start + i]  = points[grp].clone()
+
+        if device.type == "cuda":
+            torch.cuda.empty_cache()
 
         logger.debug(
             "  Chunk %d/%d (props %d-%d): non_empty=%d kept=%d %.2fs",
@@ -258,33 +272,20 @@ def _pad_windows_to_batch(
     counts    = [p.shape[0] for p in valid_pts]
     max_n     = max(counts)
 
-    all_pts = torch.cat(valid_pts, dim=0)
-    total   = all_pts.shape[0]
+    counts_t = torch.tensor(counts, dtype=torch.long, device=device)
+    reps     = (max_n + counts_t - 1) // counts_t
 
-    win_ids = torch.repeat_interleave(
-        torch.arange(B, device=device),
-        torch.tensor(counts, device=device),
-    )
-
-    ones    = torch.ones(total, dtype=torch.long, device=device)
-            cum     = torch.cumsum(ones, 0) - 1
-    is_new  = torch.cat([
-        torch.ones(1, dtype=torch.bool, device=device),
-        win_ids[1:] != win_ids[:-1],
-    ])
-    starts  = torch.zeros(total, dtype=torch.long, device=device)
-    starts[is_new] = cum[is_new]
-    starts  = torch.cummax(starts, dim=0).values
-
-    counts_t  = torch.tensor(counts, dtype=torch.long, device=device)
-    reps      = (max_n + counts_t - 1) // counts_t
     tiled_parts: list[Tensor] = []
     for k in range(B):
-        p = valid_pts[k]
+        p = valid_pts[k].to(device)
         r = int(reps[k].item())
         tiled_parts.append(p.repeat(r, 1)[:max_n])
 
     batched = torch.stack(tiled_parts, dim=0)
+    # явный del — исключает одновременное хранение списка и батча
+    # пик без del: 2 × B × max_n × 3 × dtype_size
+    del tiled_parts
+
     return batched, valid_idx
 
 
@@ -395,7 +396,7 @@ class TreeRCNN(nn.Module):
             _cls_raw, _reg_raw = self._run_stage1_on_anchors(
                 points, all_anchors, infer_mode=True, tag="s1_scan"
             )
-        # Явный del до clone — освобождает grad-граф (если он есть) немедленно
+        # явный del до clone — освобождает grad-граф немедленно
         all_cls = _cls_raw.detach().clone()
         all_reg = _reg_raw.detach().clone()
         del _cls_raw, _reg_raw
@@ -441,6 +442,11 @@ class TreeRCNN(nn.Module):
 
         cache = {"scores_ad": scores_ad, "boxes_ad": boxes_ad,
                  "scores_al": scores_al, "boxes_al": boxes_al, "sizes_al": sizes_al}
+
+        # явный del all_cls/all_reg — логиты больше не нужны, cache уже содержит
+        # декодированные боксы; без del они жили бы до конца вызывающего scope
+        del all_cls, all_reg
+
         return loss_dict, cache
 
     def _stage1_proposals_from_cache(self, cache, ad, al_list, device):
