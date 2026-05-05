@@ -10,6 +10,10 @@ quality_score = harmonic_mean(precision, recall)
   precision = matched / detected   (штраф за спам)
   recall    = matched / reference  (штраф за пропуски)
   F1        = 2 * P * R / (P + R)
+
+Changes:
+  - model.set_epoch(epoch) called each epoch for two-phase freeze policy.
+  - AdamW added as optimizer option (was missing despite being in config).
 """
 
 from __future__ import annotations
@@ -56,10 +60,9 @@ def set_seed(seed: int) -> None:
 
 
 def _f1_score(matched: int, detected: int, reference: int) -> float:
-    """Micro-averaged F1 across all plots."""
     if detected == 0 and reference == 0:
         return 0.0
-    precision = matched / detected if detected > 0 else 0.0
+    precision = matched / detected  if detected  > 0 else 0.0
     recall    = matched / reference if reference > 0 else 0.0
     if precision + recall == 0:
         return 0.0
@@ -67,17 +70,9 @@ def _f1_score(matched: int, detected: int, reference: int) -> float:
 
 
 def _quality_score(plot_metrics: list[PlotMetrics]) -> tuple[float, dict]:
-    """
-    Compute F1-based quality score + full metrics dict for JSON report.
-
-    Returns
-    -------
-    score : float   — primary metric used to select best.pth
-    info  : dict    — all numbers written to the JSON report
-    """
-    total_detected  = sum(pm.n_test   for pm in plot_metrics)
-    total_reference = sum(pm.n_ref    for pm in plot_metrics)
-    total_matched   = sum(pm.n_match  for pm in plot_metrics)
+    total_detected  = sum(pm.n_test  for pm in plot_metrics)
+    total_reference = sum(pm.n_ref   for pm in plot_metrics)
+    total_matched   = sum(pm.n_match for pm in plot_metrics)
 
     precision = total_matched / total_detected  if total_detected  > 0 else 0.0
     recall    = total_matched / total_reference if total_reference > 0 else 0.0
@@ -89,15 +84,15 @@ def _quality_score(plot_metrics: list[PlotMetrics]) -> tuple[float, dict]:
         "total_detected":  total_detected,
         "total_reference": total_reference,
         "total_matched":   total_matched,
-        "precision":       round(precision,      4),
-        "recall":          round(recall,          4),
-        "f1":              round(f1,              4),
-        "rms_matching":    round(gm.rms_ass,      4),
-        "rms_extraction":  round(gm.rms_extr,     4),
-        "rms_commission":  round(gm.rms_com,      4),
-        "rms_overall":     round(gm.rms_om,       4),
-        "rms_h_error_m":   round(gm.rms_h,        4),
-        "rms_v_error_m":   round(gm.rms_v,        4),
+        "precision":       round(precision,   4),
+        "recall":          round(recall,       4),
+        "f1":              round(f1,           4),
+        "rms_matching":    round(gm.rms_ass,   4),
+        "rms_extraction":  round(gm.rms_extr,  4),
+        "rms_commission":  round(gm.rms_com,   4),
+        "rms_overall":     round(gm.rms_om,    4),
+        "rms_h_error_m":   round(gm.rms_h,     4),
+        "rms_v_error_m":   round(gm.rms_v,     4),
         "per_plot": [
             {
                 "plot_id":   pm.plot_id,
@@ -124,10 +119,10 @@ def save_checkpoint(
     cfg=None,
 ) -> None:
     payload = {
-        "epoch": epoch,
-        "model_state_dict": model.state_dict(),
+        "epoch":              epoch,
+        "model_state_dict":   model.state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
-        "best_score": best_score,
+        "best_score":         best_score,
     }
     if cfg is not None:
         payload["cfg"] = OmegaConf.to_container(cfg, resolve=True)
@@ -144,7 +139,6 @@ def load_checkpoint(
     ckpt = torch.load(str(path), map_location=device)
     model.load_state_dict(ckpt["model_state_dict"])
     optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-    # поддержка старых чекпоинтов где ключ был best_rms
     score = ckpt.get("best_score", ckpt.get("best_rms", 0.0))
     logger.info("Resumed from %s (epoch %d, best_score=%.4f)", path, ckpt["epoch"], score)
     return ckpt["epoch"], score
@@ -168,7 +162,7 @@ def _evaluate_fold(
             points       = sample["points"].to(device)
             gt_boxes     = sample["gt_boxes"].to(device)
             local_maxima = sample["local_maxima"].to(device)
-            plot_bounds  = sample["plot_bounds"]   # list[float] — не нужен .to()
+            plot_bounds  = sample["plot_bounds"]
             plot_id      = sample["plot_id"]
 
             logger.info(
@@ -177,13 +171,12 @@ def _evaluate_fold(
             )
 
             t_plot = time.perf_counter()
-            out = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
+            out    = model(points, gt_boxes, local_maxima, plot_bounds, training=False)
             elapsed = time.perf_counter() - t_plot
 
-            n_pred = len(out["boxes"])
             logger.info(
                 "Val plot %d: inference done in %.2fs, predicted_boxes=%d",
-                plot_id, elapsed, n_pred,
+                plot_id, elapsed, len(out["boxes"]),
             )
 
             detected = extract_tree_positions(
@@ -219,8 +212,7 @@ def train_fold(
     device: torch.device,
 ) -> None:
     assert cfg.training.batch_size == 1, (
-        "batch_size > 1 is not supported: the current collate/unwrap logic "
-        "assumes a single sample per batch."
+        "batch_size > 1 is not supported."
     )
 
     logger.info("=== Fold %d | Train: %s | Val: %s ===", fold_idx, train_ids, val_ids)
@@ -230,23 +222,13 @@ def train_fold(
         augment_data=True,
         max_points=cfg.training.max_points,
     )
-
-    # Validation uses a separate max_points cap.
-    # IMPORTANT: do NOT set this to None — stage2 inference calls
-    # _subsample_points_in_box in a Python loop over all proposals,
-    # so with a full point cloud (1-4M pts) and thousands of proposals
-    # the loop becomes O(proposals * points) and hangs indefinitely.
-    # Default 200_000 keeps local density sufficient while bounding runtime.
     val_max_points: int = cfg.training.get("val_max_points", 200_000)
     val_ds = NewforDataset(
         data_root, val_ids, cfg,
         augment_data=False,
         max_points=val_max_points,
     )
-    logger.info(
-        "Val dataset: %d plots, val_max_points=%d",
-        len(val_ds), val_max_points,
-    )
+    logger.info("Val dataset: %d plots, val_max_points=%d", len(val_ds), val_max_points)
 
     num_workers: int = cfg.training.get("num_workers", 0)
     train_loader = DataLoader(
@@ -260,20 +242,19 @@ def train_fold(
 
     model = TreeRCNN(cfg).to(device)
 
-    lr = cfg.training.get("learning_rate", 1e-3)
-    wd = cfg.training.get("weight_decay", 1e-4)
+    lr       = cfg.training.get("learning_rate", 1e-3)
+    wd       = cfg.training.get("weight_decay",  1e-4)
+    opt_name = cfg.training.get("optimizer", "adam").lower()
 
-    opt_name: str = cfg.training.get("optimizer", "adam").lower()
     if opt_name == "adagrad":
         optimizer = torch.optim.Adagrad(model.parameters(), lr=lr, weight_decay=wd)
     elif opt_name == "sgd":
-        optimizer = torch.optim.SGD(model.parameters(), lr=lr,
-                                    momentum=0.9, weight_decay=wd)
+        optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
+    elif opt_name == "adamw":
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=wd)
     else:
         optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=wd)
 
-    # CosineAnnealing: LR decays to eta_min = lr * 0.1 (not lr * 1e-3)
-    # to avoid near-zero LR freezing training at later epochs
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
         optimizer, T_max=cfg.training.epochs, eta_min=lr * 0.1,
     )
@@ -293,8 +274,18 @@ def train_fold(
     max_grad_norm: float = cfg.training.get("max_grad_norm", 1.0)
     ckpt_interval: int   = cfg.training.get("checkpoint_interval", 10)
 
+    freeze_s2_epochs: int = cfg.training.get("freeze_stage2_epochs", 0)
+    if freeze_s2_epochs > 0:
+        logger.info(
+            "Two-phase training: Stage-2 frozen for first %d epochs.",
+            freeze_s2_epochs,
+        )
+
     for epoch in range(start_epoch, cfg.training.epochs):
+        # Two-phase: update freeze state before each epoch
+        model.set_epoch(epoch)
         model.train()
+
         epoch_losses: list[float] = []
         nan_batches = 0
 
@@ -307,10 +298,8 @@ def train_fold(
             if isinstance(points,       list): points       = points[0]
             if isinstance(gt_boxes,     list): gt_boxes     = gt_boxes[0]
             if isinstance(local_maxima, list): local_maxima = local_maxima[0]
-            if isinstance(plot_bounds, (list, tuple)):
-                plot_bounds = plot_bounds[0]
-            if isinstance(plot_bounds, torch.Tensor):
-                plot_bounds = plot_bounds.squeeze().tolist()
+            if isinstance(plot_bounds, (list, tuple)): plot_bounds = plot_bounds[0]
+            if isinstance(plot_bounds, torch.Tensor):  plot_bounds = plot_bounds.squeeze().tolist()
 
             points       = points.to(device)
             gt_boxes     = gt_boxes.to(device)
@@ -323,7 +312,7 @@ def train_fold(
             if torch.isnan(total_loss) or torch.isinf(total_loss):
                 nan_batches += 1
                 logger.warning(
-                    "Epoch %d, batch %d: NaN/Inf loss — skipped (total: %d)",
+                    "Epoch %d, batch %d: NaN/Inf loss — skipped (%d total)",
                     epoch + 1, batch_idx, nan_batches,
                 )
                 optimizer.zero_grad()
@@ -351,45 +340,29 @@ def train_fold(
             optimizer.param_groups[0]["lr"],
         )
 
-        # ---- сохраняем latest каждые checkpoint_interval эпох ----------
         if (epoch + 1) % ckpt_interval == 0:
             save_checkpoint(
                 model, optimizer, epoch + 1, best_score,
-                ckpt_dir / "latest.pth",
-                cfg=cfg,
+                ckpt_dir / "latest.pth", cfg=cfg,
             )
 
-        # ---- валидация ---------------------------------------------------
         if (epoch + 1) % val_interval == 0 and len(val_ds) > 0:
-            logger.info(
-                "--- Validation started (epoch %d, %d plots) ---",
-                epoch + 1, len(val_ds),
-            )
+            logger.info("--- Validation (epoch %d, %d plots) ---", epoch + 1, len(val_ds))
             t_val = time.perf_counter()
 
             plot_metrics = _evaluate_fold(model, val_ds, cfg, device)
             score, info  = _quality_score(plot_metrics)
 
-            logger.info(
-                "--- Validation finished in %.2fs ---",
-                time.perf_counter() - t_val,
-            )
+            logger.info("--- Validation finished in %.2fs ---", time.perf_counter() - t_val)
 
             info["epoch"]      = epoch + 1
             info["fold"]       = fold_idx
             info["train_loss"] = round(float(mean_loss), 6)
 
-            # --- epoch_<E>.pth + epoch_<E>.json (сохраняем ВСЕГДА) ------
             epoch_ckpt = ckpt_dir / f"epoch_{epoch + 1:04d}.pth"
             epoch_json = ckpt_dir / f"epoch_{epoch + 1:04d}.json"
-
-            save_checkpoint(
-                model, optimizer, epoch + 1, best_score, epoch_ckpt,
-                cfg=cfg,
-            )
-            epoch_json.write_text(
-                json.dumps(info, indent=2, ensure_ascii=False)
-            )
+            save_checkpoint(model, optimizer, epoch + 1, best_score, epoch_ckpt, cfg=cfg)
+            epoch_json.write_text(json.dumps(info, indent=2, ensure_ascii=False))
 
             logger.info(
                 "Fold %d | Epoch %d | F1=%.4f | P=%.4f | R=%.4f | "
@@ -399,16 +372,13 @@ def train_fold(
                 info["total_detected"], info["total_reference"], info["total_matched"],
             )
 
-            # --- best.pth обновляем только если F1 вырос ----------------
             if score > best_score:
                 best_score = score
                 best_ckpt  = ckpt_dir / "best.pth"
                 best_json  = ckpt_dir / "best.json"
                 shutil.copy2(epoch_ckpt, best_ckpt)
                 shutil.copy2(epoch_json, best_json)
-                logger.info(
-                    "  ★ New best! F1=%.4f — saved as best.pth", best_score
-                )
+                logger.info("  ★ New best! F1=%.4f — saved as best.pth", best_score)
 
 
 # ---------------------------------------------------------------------------

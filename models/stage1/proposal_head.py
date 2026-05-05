@@ -1,10 +1,9 @@
 """
 Stage 1: Proposal Generation Network.
 
-Fixes vs original:
-  - forward() теперь принимает батч якорей (B, N, 3) вместо одного за раз.
-    Это позволяет обработать все якоря одним GPU-вызовом вместо Python-цикла.
-  - extract_features() остаётся публичным для внешнего использования.
+Changed:
+  - reg_head outputs 6D deltas (tx, ty, tz, tw, tl, th).
+  - forward() accepts batch (B, N, 3) and returns (cls: B×1, reg: B×6).
 """
 
 from __future__ import annotations
@@ -22,11 +21,8 @@ logger = logging.getLogger(__name__)
 
 class ProposalHead(nn.Module):
     """
-    Stage-1 head: обрабатывает батч окон PointNet++,
-    предсказывает objectness score и box delta на якорь.
-
-    forward(xyz) принимает (B, N, 3) — батч из B окон по N точек каждое.
-    Возвращает (cls_logits: (B,1), reg_deltas: (B,4)).
+    Stage-1 head: processes a batch of windows with PointNet++,
+    predicts objectness score and 6D box delta per anchor.
     """
 
     def __init__(self, cfg) -> None:
@@ -61,31 +57,31 @@ class ProposalHead(nn.Module):
 
         feat_dim = sa2_mlp[-1]
         self.cls_head = nn.Linear(feat_dim, 1)   # objectness logit
-        self.reg_head = nn.Linear(feat_dim, 4)   # (tx, ty, tw, th)
+        self.reg_head = nn.Linear(feat_dim, 6)   # 6D: (tx, ty, tz, tw, tl, th)
 
     def extract_features(self, xyz: Tensor) -> Tensor:
         """
         Run PointNet++ on a batch of windows.
 
         Args:
-            xyz: (B, N, 3) normalized point coordinates
+            xyz: (B, N, 3)
 
         Returns:
             feat: (B, feat_dim)
         """
         xyz1, f1 = self.sa1(xyz, None)    # (B, 64, 64)
         xyz2, f2 = self.sa2(xyz1, f1)    # (B, 32, 128)
-        _, f3   = self.sa3(xyz2, f2)     # (B, 1, 512)
+        _, f3    = self.sa3(xyz2, f2)    # (B, 1, 512)
         return f3.squeeze(1)             # (B, 512)
 
     def forward(self, xyz: Tensor) -> tuple[Tensor, Tensor]:
         """
         Args:
-            xyz: (B, N, 3)  — батч B якорных окон, каждое N точек
+            xyz: (B, N, 3)
 
         Returns:
             cls_logits: (B, 1)
-            reg_deltas: (B, 4)
+            reg_deltas: (B, 6)
         """
         feat = self.extract_features(xyz)
         return self.cls_head(feat), self.reg_head(feat)
