@@ -2,14 +2,11 @@
 TreeRCNN: two-stage 3D tree detection network.
 
 Changes:
-  - 6D regression throughout (box_coder, proposal_head, refinement_head).
-  - Two-phase training: cfg.training.freeze_stage2_epochs (default 0)
-    keeps Stage-2 frozen for the first N epochs, letting Stage-1 produce
-    stable proposals before Stage-2 starts learning.
-  - Hard Negative Mining: Stage-1 loss passes current cls_scores to
-    assign_targets so the hardest negatives are sampled.
-  - Stage-2 loss target assignment uses detached proposals (no gradient
-    through proposals → cleaner gradient separation between stages).
+  - 6D regression throughout.
+  - Two-phase training via set_epoch().
+  - Hard Negative Mining: single-pass — infer all anchors once (no_grad),
+    assign HNM targets, then one gradient forward on sampled subset.
+  - Stage-2 proposals are detached.
 """
 
 from __future__ import annotations
@@ -46,58 +43,43 @@ _STAGE2_INFER_CHUNK   = 2048
 def _subsample_points_in_box(
     points: Tensor, box: Tensor, n: int = _MAX_POINTS_PER_BOX
 ) -> Tensor:
-    """Single-box fallback — used in _stage2_loss during training."""
     x, y, z_c, w, l, h = box.unbind()
     mask = (
-        (points[:, 0] >= x - w / 2)
-        & (points[:, 0] <= x + w / 2)
-        & (points[:, 1] >= y - l / 2)
-        & (points[:, 1] <= y + l / 2)
-        & (points[:, 2] >= 0)
-        & (points[:, 2] <= h)
+        (points[:, 0] >= x - w / 2) & (points[:, 0] <= x + w / 2)
+        & (points[:, 1] >= y - l / 2) & (points[:, 1] <= y + l / 2)
+        & (points[:, 2] >= 0) & (points[:, 2] <= h)
     )
     inside = points[mask]
     if len(inside) > n:
-        idx    = torch.randperm(len(inside), device=inside.device)[:n]
-        inside = inside[idx]
+        inside = inside[torch.randperm(len(inside), device=inside.device)[:n]]
     return inside
 
 
 def _subsample_points_batch(
     points: Tensor,
     anchors: Tensor,
-    n: int       = _MAX_POINTS_PER_BOX,
-    chunk: int   = _ANCHOR_CHUNK,
+    n: int     = _MAX_POINTS_PER_BOX,
+    chunk: int = _ANCHOR_CHUNK,
 ) -> list[Tensor]:
-    """
-    Vectorised point-in-box sampling for a batch of anchors.
-    Returns list of (N_i, 3) tensors with points centred on each anchor.
-    """
     device = points.device
     A      = anchors.shape[0]
     result: list[Tensor] = [None] * A  # type: ignore[list-item]
 
-    px = points[:, 0]
-    py = points[:, 1]
-    pz = points[:, 2]
+    px, py, pz = points[:, 0], points[:, 1], points[:, 2]
 
     for start in range(0, A, chunk):
         end = min(start + chunk, A)
         anc = anchors[start:end]
+        cx  = anc[:, 0].unsqueeze(1)
+        cy  = anc[:, 1].unsqueeze(1)
+        w   = anc[:, 3].unsqueeze(1)
+        l   = anc[:, 4].unsqueeze(1)
+        h   = anc[:, 5].unsqueeze(1)
 
-        cx = anc[:, 0].unsqueeze(1)
-        cy = anc[:, 1].unsqueeze(1)
-        w  = anc[:, 3].unsqueeze(1)
-        l  = anc[:, 4].unsqueeze(1)
-        h  = anc[:, 5].unsqueeze(1)
-
-        mask   = (
-            (px.unsqueeze(0) >= cx - w / 2)
-            & (px.unsqueeze(0) <= cx + w / 2)
-            & (py.unsqueeze(0) >= cy - l / 2)
-            & (py.unsqueeze(0) <= cy + l / 2)
-            & (pz.unsqueeze(0) >= 0)
-            & (pz.unsqueeze(0) <= h)
+        mask = (
+            (px.unsqueeze(0) >= cx - w / 2) & (px.unsqueeze(0) <= cx + w / 2)
+            & (py.unsqueeze(0) >= cy - l / 2) & (py.unsqueeze(0) <= cy + l / 2)
+            & (pz.unsqueeze(0) >= 0) & (pz.unsqueeze(0) <= h)
         )
         counts      = mask.sum(dim=1)
         _, point_idx = mask.nonzero(as_tuple=True)
@@ -108,11 +90,10 @@ def _subsample_points_batch(
                 result[start + i] = points.new_zeros(0, 3)
                 continue
             if len(grp) > n:
-                perm = torch.randperm(len(grp), device=device)[:n]
-                grp  = grp[perm]
-            pts         = points[grp].clone()
-            pts[:, 0]  -= anchors[start + i, 0]
-            pts[:, 1]  -= anchors[start + i, 1]
+                grp = grp[torch.randperm(len(grp), device=device)[:n]]
+            pts        = points[grp].clone()
+            pts[:, 0] -= anchors[start + i, 0]
+            pts[:, 1] -= anchors[start + i, 1]
             result[start + i] = pts
 
     return result  # type: ignore[return-value]
@@ -124,20 +105,13 @@ def _subsample_points_batch_proposals(
     n: int     = _MAX_POINTS_PER_BOX,
     chunk: int = _STAGE2_INFER_CHUNK,
 ) -> list[Tensor]:
-    """
-    Vectorised point-in-box sampling for Stage-2 proposals.
-    Returns absolute coordinates (no centering).
-    """
     device = points.device
     if proposals.device != device:
         proposals = proposals.to(device)
 
     P      = proposals.shape[0]
     result: list[Tensor] = [None] * P  # type: ignore[list-item]
-
-    px = points[:, 0].to(device)
-    py = points[:, 1].to(device)
-    pz = points[:, 2].to(device)
+    px, py, pz = points[:, 0].to(device), points[:, 1].to(device), points[:, 2].to(device)
 
     total_chunks = (P + chunk - 1) // chunk
     logger.info(
@@ -148,36 +122,31 @@ def _subsample_points_batch_proposals(
     for chunk_idx, start in enumerate(range(0, P, chunk), start=1):
         end  = min(start + chunk, P)
         prop = proposals[start:end]
-
         t_chunk = time.perf_counter()
+
         cx = prop[:, 0].unsqueeze(1)
         cy = prop[:, 1].unsqueeze(1)
         w  = prop[:, 3].unsqueeze(1)
         l  = prop[:, 4].unsqueeze(1)
         h  = prop[:, 5].unsqueeze(1)
 
-        mask   = (
-            (px.unsqueeze(0) >= cx - w / 2)
-            & (px.unsqueeze(0) <= cx + w / 2)
-            & (py.unsqueeze(0) >= cy - l / 2)
-            & (py.unsqueeze(0) <= cy + l / 2)
-            & (pz.unsqueeze(0) >= 0)
-            & (pz.unsqueeze(0) <= h)
+        mask = (
+            (px.unsqueeze(0) >= cx - w / 2) & (px.unsqueeze(0) <= cx + w / 2)
+            & (py.unsqueeze(0) >= cy - l / 2) & (py.unsqueeze(0) <= cy + l / 2)
+            & (pz.unsqueeze(0) >= 0) & (pz.unsqueeze(0) <= h)
         )
         counts      = mask.sum(dim=1)
         _, point_idx = mask.nonzero(as_tuple=True)
         groups      = torch.split(point_idx, counts.tolist())
 
-        non_empty  = 0
-        total_kept = 0
+        non_empty = total_kept = 0
         for i, grp in enumerate(groups):
             if len(grp) == 0:
                 result[start + i] = points.new_zeros(0, 3)
                 continue
             non_empty += 1
             if len(grp) > n:
-                perm = torch.randperm(len(grp), device=device)[:n]
-                grp  = grp[perm]
+                grp = grp[torch.randperm(len(grp), device=device)[:n]]
             total_kept        += len(grp)
             result[start + i]  = points[grp].clone()
 
@@ -201,13 +170,11 @@ def _pad_windows_to_batch(
 
     valid_pts = [pts_list[i] for i in valid_idx]
     max_n     = max(p.shape[0] for p in valid_pts)
-
-    batched = torch.zeros(len(valid_pts), max_n, 3, device=device)
+    batched   = torch.zeros(len(valid_pts), max_n, 3, device=device)
     for k, pts in enumerate(valid_pts):
         n = pts.shape[0]
         if n < max_n:
-            reps = (max_n + n - 1) // n
-            pts  = pts.repeat(reps, 1)[:max_n]
+            pts = pts.repeat((max_n + n - 1) // n, 1)[:max_n]
         batched[k] = pts
     return batched, valid_idx
 
@@ -229,31 +196,22 @@ class TreeRCNN(nn.Module):
         self._focal_alpha: float = float(fl.get("alpha", 0.25) if fl else 0.25)
         self._focal_gamma: float = float(fl.get("gamma", 2.0)  if fl else 2.0)
 
-        self._s2_chunk: int = int(
-            cfg.training.get("stage2_infer_chunk", _STAGE2_INFER_CHUNK)
-        )
-        # Two-phase: freeze Stage-2 for first N epochs
-        self._freeze_s2_epochs: int = int(
-            cfg.training.get("freeze_stage2_epochs", 0)
-        )
-        self._current_epoch: int = 0
+        self._s2_chunk: int         = int(cfg.training.get("stage2_infer_chunk", _STAGE2_INFER_CHUNK))
+        self._freeze_s2_epochs: int = int(cfg.training.get("freeze_stage2_epochs", 0))
+        self._current_epoch: int    = 0
 
-    # ------------------------------------------------------------------
-    # Epoch counter (call from train loop: model.set_epoch(epoch))
-    # ------------------------------------------------------------------
     def set_epoch(self, epoch: int) -> None:
-        """Update internal epoch counter and apply two-phase freeze policy."""
         self._current_epoch = epoch
         freeze = epoch < self._freeze_s2_epochs
         for p in self.stage2.parameters():
             p.requires_grad = not freeze
         if freeze:
-            logger.debug("Epoch %d: Stage-2 FROZEN (freeze_stage2_epochs=%d)",
-                         epoch, self._freeze_s2_epochs)
+            logger.debug("Epoch %d: Stage-2 FROZEN", epoch)
         elif epoch == self._freeze_s2_epochs and self._freeze_s2_epochs > 0:
             logger.info("Epoch %d: Stage-2 UNFROZEN — two-phase transition.", epoch)
 
     # ------------------------------------------------------------------
+
     def forward(
         self,
         points: Tensor,
@@ -269,23 +227,15 @@ class TreeRCNN(nn.Module):
         while local_maxima.dim() > 2: local_maxima = local_maxima.squeeze(0)
 
         device = points.device
-        pb = (
-            tuple(plot_bounds.tolist())
-            if isinstance(plot_bounds, Tensor)
-            else plot_bounds
-        )
+        pb = tuple(plot_bounds.tolist()) if isinstance(plot_bounds, Tensor) else plot_bounds
 
-        # ---- Anchor generation ----------------------------------------
         t1 = time.perf_counter()
         ad, al_list = self.anchor_gen.generate_all(pb, local_maxima.cpu().numpy())
         ad      = ad.to(device)
         al_flat = [a.to(device) for a in al_list]
-        logger.debug(
-            "Anchors: ad=%d  al=%d  (%.2fs)",
-            len(ad), sum(len(a) for a in al_flat), time.perf_counter() - t1,
-        )
+        logger.debug("Anchors: ad=%d al=%d (%.2fs)",
+                     len(ad), sum(len(a) for a in al_flat), time.perf_counter() - t1)
 
-        # ---- Stage 1 --------------------------------------------------
         if training:
             loss_s1 = self._stage1_loss(points, ad, al_flat, gt_boxes)
         else:
@@ -299,69 +249,51 @@ class TreeRCNN(nn.Module):
             zero = torch.tensor(0.0, device=device)
             logger.warning("No S1 proposals — zero loss")
             if training:
-                return {
-                    **loss_s1,
-                    "loss_stage2_cls": zero,
-                    "loss_stage2_reg": zero,
-                    "total_loss": loss_s1.get("total_loss_stage1", zero),
-                }
-            return {"boxes": torch.zeros(0, 6, device=device), "scores": torch.zeros(0, device=device)}
+                return {**loss_s1,
+                        "loss_stage2_cls": zero, "loss_stage2_reg": zero,
+                        "total_loss": loss_s1.get("total_loss_stage1", zero)}
+            return {"boxes": torch.zeros(0, 6, device=device),
+                    "scores": torch.zeros(0, device=device)}
 
-        # ---- Stage 2 --------------------------------------------------
         if training:
-            # Detach proposals so Stage-2 gradients don't flow into Stage-1.
-            # Each stage learns from its own loss independently.
             loss_s2 = self._stage2_loss(points, proposals.detach(), gt_boxes)
-
-            total = (
+            total   = (
                 loss_s1.get("total_loss_stage1", torch.tensor(0.0, device=device))
                 + loss_s2["total_loss_stage2"]
             )
             if torch.isnan(total) or torch.isinf(total):
-                logger.warning("NaN/Inf in total_loss — skipping batch")
+                logger.warning("NaN/Inf total_loss — skipping batch")
                 total = torch.tensor(0.0, device=device, requires_grad=True)
-
-            logger.debug(
-                "Forward %.2fs | loss=%.4f",
-                time.perf_counter() - t0, total.item(),
-            )
+            logger.debug("Forward %.2fs | loss=%.4f",
+                         time.perf_counter() - t0, total.item())
             return {**loss_s1, **loss_s2, "total_loss": total}
 
         final_boxes, final_scores = self._stage2_inference(points, proposals)
-        logger.info(
-            "  Stage2 inference done: %d final boxes (%.2fs total)",
-            len(final_boxes), time.perf_counter() - t0,
-        )
+        logger.info("  Stage2 inference done: %d final boxes (%.2fs total)",
+                    len(final_boxes), time.perf_counter() - t0)
         return {"boxes": final_boxes, "scores": final_scores}
 
     # ------------------------------------------------------------------
-    def _stage1_loss(self, points, ad, al_list, gt_boxes):
+
+    def _stage1_loss(self, points: Tensor, ad: Tensor, al_list: list[Tensor], gt_boxes: Tensor) -> dict:
+        """
+        Single-pass HNM:
+          1. Infer ALL anchors with no_grad  → get cls_scores for HNM.
+          2. assign_targets with cls_scores  → hard-negative sampled indices.
+          3. One gradient forward on sampled subset only.
+        """
         all_anchors = torch.cat([ad] + al_list, dim=0) if al_list else ad
         cfg_la      = self.cfg.label_assignment
 
-        # First pass — random negative sampling (no scores yet)
-        labels, reg_targets, _, sampled = assign_targets(
-            all_anchors, gt_boxes,
-            pos_iouv=cfg_la.positive_iouv_overlap,
-            pos_ioub=cfg_la.positive_ioub_overlap,
-            pos_iouh=cfg_la.positive_iouh_overlap,
-            n_pos=self.cfg.training.n_positive,
-            n_neg=self.cfg.training.n_negative,
-        )
-
-        sampled_anchors = all_anchors[sampled]
-        cls_logits, reg_deltas = self._run_stage1_on_anchors(
-            points, sampled_anchors, infer_mode=False, tag="s1_loss"
-        )
-
-        # Second pass — Hard Negative Mining with current scores
+        # Step 1: score all anchors cheaply (no gradients, no point sampling twice)
         with torch.no_grad():
             all_cls, _ = self._run_stage1_on_anchors(
-                points, all_anchors, infer_mode=True, tag="s1_hnm"
+                points, all_anchors, infer_mode=True, tag="s1_hnm_scan"
             )
             cls_scores_all = torch.sigmoid(all_cls.squeeze(-1))
 
-        _, _, _, sampled_hnm = assign_targets(
+        # Step 2: assign labels + HNM sampling in one call
+        labels, reg_targets, _, sampled = assign_targets(
             all_anchors, gt_boxes,
             pos_iouv=cfg_la.positive_iouv_overlap,
             pos_ioub=cfg_la.positive_ioub_overlap,
@@ -371,25 +303,26 @@ class TreeRCNN(nn.Module):
             cls_scores=cls_scores_all,
         )
 
-        sampled_anchors_hnm = all_anchors[sampled_hnm]
-        cls_logits, reg_deltas = self._run_stage1_on_anchors(
-            points, sampled_anchors_hnm, infer_mode=False, tag="s1_loss_hnm"
+        # Step 3: gradient forward only on the sampled subset
+        sampled_anchors          = all_anchors[sampled]
+        cls_logits, reg_deltas   = self._run_stage1_on_anchors(
+            points, sampled_anchors, infer_mode=False, tag="s1_grad"
         )
-        sampled_labels = labels[sampled_hnm].float()
+        sampled_labels = labels[sampled].float()
 
         cls_loss = sigmoid_focal_loss(
             cls_logits.squeeze(-1), sampled_labels,
-            alpha=self._focal_alpha,
-            gamma=self._focal_gamma,
+            alpha=self._focal_alpha, gamma=self._focal_gamma,
         )
         pos_mask = sampled_labels == 1
         reg_loss = (
-            smooth_l1_loss(reg_deltas[pos_mask], reg_targets[sampled_hnm][pos_mask])
+            smooth_l1_loss(reg_deltas[pos_mask], reg_targets[sampled][pos_mask])
             if pos_mask.any()
             else torch.tensor(0.0, device=points.device)
         )
         total = cls_loss + self.lambda_reg * reg_loss
-        return {"loss_stage1_cls": cls_loss, "loss_stage1_reg": reg_loss, "total_loss_stage1": total}
+        return {"loss_stage1_cls": cls_loss, "loss_stage1_reg": reg_loss,
+                "total_loss_stage1": total}
 
     def _run_stage1_on_anchors(
         self,
@@ -398,18 +331,16 @@ class TreeRCNN(nn.Module):
         infer_mode: bool = True,
         tag: str = "",
     ) -> tuple[Tensor, Tensor]:
-        device = points.device
-        A      = len(anchors)
-        t      = time.perf_counter()
-
+        device    = points.device
+        A         = len(anchors)
+        t         = time.perf_counter()
         pts_list  = _subsample_points_batch(points, anchors)
         t_sample  = time.perf_counter() - t
 
         valid_idx = [i for i, p in enumerate(pts_list) if p.shape[0] >= _MIN_POINTS_FOR_NET]
-        V = len(valid_idx)
-
-        cls_out = torch.zeros(A, 1, device=device)
-        reg_out = torch.zeros(A, 6, device=device)
+        V         = len(valid_idx)
+        cls_out   = torch.zeros(A, 1, device=device)
+        reg_out   = torch.zeros(A, 6, device=device)
 
         if not valid_idx:
             logger.warning("  [%s] 0 valid anchors/%d", tag, A)
@@ -422,71 +353,58 @@ class TreeRCNN(nn.Module):
         ctx = torch.no_grad() if infer_mode else torch.enable_grad()
         with ctx:  # type: ignore[attr-defined]
             for start in range(0, V, mb):
-                end   = min(start + mb, V)
+                end      = min(start + mb, V)
                 batch, _ = _pad_windows_to_batch(valid_pts[start:end], device)
-                c, r  = self.stage1(batch)
+                c, r     = self.stage1(batch)
                 for k, orig_i in enumerate(valid_idx[start:end]):
                     cls_out[orig_i] = c[k].detach() if infer_mode else c[k]
                     reg_out[orig_i] = r[k].detach() if infer_mode else r[k]
 
-        n_mb = (V + mb - 1) // mb
-        logger.debug(
-            "  [%s] anchors=%d valid=%d | sample=%.2fs fwd=%.2fs (%d mb)",
-            tag, A, V, t_sample, time.perf_counter() - t_fwd, n_mb,
-        )
+        logger.debug("  [%s] anchors=%d valid=%d | sample=%.2fs fwd=%.2fs (%d mb)",
+                     tag, A, V, t_sample, time.perf_counter() - t_fwd,
+                     (V + mb - 1) // mb)
         return cls_out, reg_out
 
-    def _stage1_proposals(self, points, ad, al_list, device):
-        cfg_nms       = self.cfg.stage1_nms
-        ad_score_thr  = float(getattr(cfg_nms, "ad_score_threshold", 0.0))
+    def _stage1_proposals(self, points: Tensor, ad: Tensor, al_list: list[Tensor], device) -> Tensor:
+        cfg_nms      = self.cfg.stage1_nms
+        ad_score_thr = float(getattr(cfg_nms, "ad_score_threshold", 0.0))
 
         if len(ad) > 0:
             cls_ad, reg_ad = self._run_stage1_on_anchors(points, ad, infer_mode=True, tag="ad")
             scores_ad = torch.sigmoid(cls_ad.squeeze(-1))
             boxes_ad  = decode_boxes(reg_ad, ad)
-            keep_ad   = nms3d(
-                boxes_ad, scores_ad,
-                cfg_nms.ad_iouv_threshold,
-                cfg_nms.ad_max_proposals,
-                score_threshold=ad_score_thr,
-            )
-            props_ad = boxes_ad[keep_ad]
+            keep_ad   = nms3d(boxes_ad, scores_ad,
+                              cfg_nms.ad_iouv_threshold, cfg_nms.ad_max_proposals,
+                              score_threshold=ad_score_thr)
+            props_ad  = boxes_ad[keep_ad]
         else:
             props_ad = torch.zeros(0, 6, device=device)
 
         if al_list:
-            al_all  = torch.cat(al_list, dim=0)
-            sizes   = [len(a) for a in al_list]
-
-            cls_al, reg_al = self._run_stage1_on_anchors(
-                points, al_all, infer_mode=True, tag="al"
-            )
+            al_all    = torch.cat(al_list, dim=0)
+            sizes     = [len(a) for a in al_list]
+            cls_al, reg_al = self._run_stage1_on_anchors(points, al_all, infer_mode=True, tag="al")
             scores_al = torch.sigmoid(cls_al.squeeze(-1))
             boxes_al  = decode_boxes(reg_al, al_all)
 
-            parts  = []
-            offset = 0
+            parts, offset = [], 0
             for sz in sizes:
                 if sz == 0:
                     offset += sz
                     continue
                 sl   = slice(offset, offset + sz)
-                keep = nms3d(
-                    boxes_al[sl], scores_al[sl],
-                    cfg_nms.al_iouv_threshold,
-                    cfg_nms.al_max_proposals_per_maxima,
-                )
+                keep = nms3d(boxes_al[sl], scores_al[sl],
+                             cfg_nms.al_iouv_threshold, cfg_nms.al_max_proposals_per_maxima)
                 parts.append(boxes_al[sl][keep])
                 offset += sz
-
             props_al = torch.cat(parts, dim=0) if parts else torch.zeros(0, 6, device=device)
         else:
             props_al = torch.zeros(0, 6, device=device)
 
         return torch.cat([props_ad, props_al], dim=0)
 
-    def _stage2_loss(self, points, proposals, gt_boxes):
-        cfg_la  = self.cfg.label_assignment
+    def _stage2_loss(self, points: Tensor, proposals: Tensor, gt_boxes: Tensor) -> dict:
+        cfg_la = self.cfg.label_assignment
         labels, reg_targets, _, sampled = assign_targets(
             proposals, gt_boxes,
             pos_iouv=cfg_la.positive_iouv_overlap,
@@ -495,15 +413,14 @@ class TreeRCNN(nn.Module):
             n_pos=self.cfg.training.n_positive,
             n_neg=self.cfg.training.n_negative,
         )
-        sampled_props = proposals[sampled]
-        pts_list      = [_subsample_points_in_box(points, p) for p in sampled_props]
+        sampled_props          = proposals[sampled]
+        pts_list               = [_subsample_points_in_box(points, p) for p in sampled_props]
         cls_logits, reg_deltas = self.stage2(pts_list, sampled_props)
 
         sampled_labels = labels[sampled].float()
-        cls_loss       = sigmoid_focal_loss(
+        cls_loss = sigmoid_focal_loss(
             cls_logits.squeeze(-1), sampled_labels,
-            alpha=self._focal_alpha,
-            gamma=self._focal_gamma,
+            alpha=self._focal_alpha, gamma=self._focal_gamma,
         )
         pos_mask = sampled_labels == 1
         reg_loss = (
@@ -512,11 +429,11 @@ class TreeRCNN(nn.Module):
             else torch.tensor(0.0, device=points.device)
         )
         total = cls_loss + self.lambda_reg * reg_loss
-        return {"loss_stage2_cls": cls_loss, "loss_stage2_reg": reg_loss, "total_loss_stage2": total}
+        return {"loss_stage2_cls": cls_loss, "loss_stage2_reg": reg_loss,
+                "total_loss_stage2": total}
 
-    def _stage2_inference(self, points: Tensor, proposals: Tensor):
-        cfg_nms = self.cfg.stage2_nms
-
+    def _stage2_inference(self, points: Tensor, proposals: Tensor) -> tuple[Tensor, Tensor]:
+        cfg_nms  = self.cfg.stage2_nms
         t_sample = time.perf_counter()
         pts_list = _subsample_points_batch_proposals(
             points, proposals, n=_MAX_POINTS_PER_BOX, chunk=self._s2_chunk
@@ -531,10 +448,8 @@ class TreeRCNN(nn.Module):
 
         score_mask      = scores >= cfg_nms.score_threshold
         refined, scores = refined[score_mask], scores[score_mask]
-        logger.info(
-            "  Stage2 score filter: %d -> %d boxes",
-            len(score_mask), len(refined),
-        )
+        logger.info("  Stage2 score filter: %d -> %d boxes",
+                    len(score_mask), len(refined))
 
         if len(refined) == 0:
             return refined, scores
