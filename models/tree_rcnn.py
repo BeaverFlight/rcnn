@@ -3,13 +3,17 @@ TreeRCNN: two-stage 3D tree detection network.
 
 Memory strategy:
   - Stage-1: vectorised _subsample_points_batch (chunked [A_chunk x N] mask).
-  - Stage-2 training: _subsample_points_loss — pure Python loop, one proposal
-    at a time, NO [P x N] broadcast tensor ever allocated on GPU.
-    Forward through stage2 is then chunked by stage2_forward_chunk.
+  - Stage-2 training (_stage2_loss):
+      1. proposals и points переносятся на CPU для сэмплинга.
+      2. _subsample_points_loss — Python loop, маска [N_cpu] per proposal,
+         нет GPU-аллокаций вообще на этом этапе.
+      3. pts_list хранится в RAM (CPU-тензоры).
+      4. В цикле forward только текущий чанк грузится на GPU:
+         chunk_pts = [p.to(device) for p in pts_list[start:end]]
+         Пиковая VRAM = chunk_size * max_pts * 3 * fp16 = ~1.5 MB при chunk=256.
+      5. torch.cuda.empty_cache() между чанками.
   - Stage-2 inference: _subsample_points_batch_proposals — chunked broadcast,
-    safe because inference runs under torch.no_grad and smaller proposal sets.
-  - torch.cuda.empty_cache() called between stage2 forward chunks during
-    training to release fragmented blocks.
+    безопасен под torch.inference_mode и меньших proposal наборах.
 """
 
 from __future__ import annotations
@@ -36,7 +40,7 @@ _MAX_POINTS_PER_BOX = 512
 _MIN_POINTS_FOR_NET = 4
 _ANCHOR_CHUNK       = 1024
 _STAGE1_INFER_BATCH = 64
-_STAGE2_INFER_CHUNK = 256   # default for inference broadcast mask
+_STAGE2_INFER_CHUNK = 256
 
 
 # ---------------------------------------------------------------------------
@@ -46,7 +50,7 @@ _STAGE2_INFER_CHUNK = 256   # default for inference broadcast mask
 def _subsample_points_in_box(
     points: Tensor, box: Tensor, n: int = _MAX_POINTS_PER_BOX
 ) -> Tensor:
-    """Sample up to n points inside a single 3-D box. CPU-friendly, no alloc."""
+    """Sample up to n points inside a single 3-D box."""
     x, y, z_c, w, l, h = box.unbind()
     mask = (
         (points[:, 0] >= x - w / 2) & (points[:, 0] <= x + w / 2)
@@ -60,33 +64,36 @@ def _subsample_points_in_box(
 
 
 def _subsample_points_loss(
-    points: Tensor,
-    proposals: Tensor,
+    points_cpu: Tensor,
+    proposals_cpu: Tensor,
     n: int = _MAX_POINTS_PER_BOX,
 ) -> list[Tensor]:
     """
-    Sample points for TRAINING stage-2 loss.
+    CPU-only point sampling for stage-2 training loss.
 
-    Uses a plain Python loop — one proposal at a time — so the maximum
-    extra GPU allocation is O(N_points) per iteration instead of
-    O(chunk * N_points) from a broadcast mask.  With N=150k and dtype=bool
-    that is 150 KB per step vs 38 MB per chunk — preventing OOM on
-    large n_pos + n_neg counts.
+    Both tensors must already be on CPU. Returns a list of CPU tensors.
+    No GPU memory is allocated at all during this call — the entire
+    pts_list lives in RAM and is loaded to GPU one chunk at a time
+    inside _stage2_loss.
+
+    Memory per step: [N_cpu] bool = N * 1 byte (e.g. 150 KB for N=150k).
     """
+    assert points_cpu.device.type == "cpu", "points must be on CPU"
     result: list[Tensor] = []
-    px = points[:, 0]
-    py = points[:, 1]
-    pz = points[:, 2]
-    for i in range(len(proposals)):
-        p = proposals[i]
+    px = points_cpu[:, 0]
+    py = points_cpu[:, 1]
+    pz = points_cpu[:, 2]
+    for i in range(len(proposals_cpu)):
+        p = proposals_cpu[i]
         mask = (
             (px >= p[0] - p[3] / 2) & (px <= p[0] + p[3] / 2)
             & (py >= p[1] - p[4] / 2) & (py <= p[1] + p[4] / 2)
             & (pz >= 0)               & (pz <= p[5])
         )
-        inside = points[mask]
+        inside = points_cpu[mask]
         if len(inside) > n:
-            inside = inside[torch.randperm(len(inside), device=points.device)[:n]]
+            perm   = torch.randperm(len(inside))[:n]  # CPU randperm — no CUDA alloc
+            inside = inside[perm]
         result.append(inside)
     return result
 
@@ -98,9 +105,8 @@ def _subsample_points_batch(
     chunk: int = _ANCHOR_CHUNK,
 ) -> list[Tensor]:
     """
-    For each anchor return up to `n` points inside its box,
-    translated to anchor-local XY coordinates.
-    Vectorised on GPU: builds a [chunk x N] bool mask per iteration.
+    Vectorised GPU sampling for stage-1 anchors.
+    Builds a [chunk x N] bool mask per iteration.
     """
     device = points.device
     A      = anchors.shape[0]
@@ -176,8 +182,9 @@ def _subsample_points_batch_proposals(
     chunk: int = _STAGE2_INFER_CHUNK,
 ) -> list[Tensor]:
     """
-    Vectorised sampling for INFERENCE (torch.no_grad context).
-    Allocates a [chunk x N] bool mask — keep chunk small (<=256).
+    Vectorised GPU sampling for stage-2 INFERENCE.
+    Safe under torch.inference_mode — no grad graph, smaller proposal sets.
+    Builds a [chunk x N] bool mask per iteration.
     """
     device = points.device
     if proposals.device != device:
@@ -185,9 +192,9 @@ def _subsample_points_batch_proposals(
 
     P      = proposals.shape[0]
     result: list[Tensor] = [None] * P  # type: ignore[list-item]
-    px = points[:, 0].to(device)
-    py = points[:, 1].to(device)
-    pz = points[:, 2].to(device)
+    px = points[:, 0]
+    py = points[:, 1]
+    pz = points[:, 2]
 
     total_chunks = (P + chunk - 1) // chunk
     logger.info(
@@ -535,14 +542,19 @@ class TreeRCNN(nn.Module):
 
     def _stage2_loss(self, points: Tensor, proposals: Tensor, gt_boxes: Tensor) -> dict:
         """
-        Stage-2 training loss.
+        Stage-2 training loss с CPU offload proposals.
 
-        Point sampling uses _subsample_points_loss (per-proposal loop, no
-        [P x N] GPU broadcast).  Forward through stage2 is split into
-        chunks of size stage2_forward_chunk; empty_cache is called between
-        chunks to release CUDA memory fragments.
+        Схема:
+          1. proposals + points → CPU для сэмплинга (нет GPU-аллокаций).
+          2. pts_list — список CPU-тензоров, хранится в RAM.
+          3. В цикле forward текущий чанк грузится на GPU:
+               [p.to(device) for p in pts_list[start:end]]
+             Пиковая VRAM от pts = chunk * max_pts * 3 * fp16 ≈ 1.5 MB.
+          4. torch.cuda.empty_cache() между чанками.
         """
         cfg_la = self.cfg.label_assignment
+        device = points.device
+
         labels, reg_targets, _, sampled = assign_targets(
             proposals, gt_boxes,
             pos_iouv=cfg_la.positive_iouv_overlap,
@@ -552,31 +564,39 @@ class TreeRCNN(nn.Module):
             n_neg=self.cfg.training.n_negative,
         )
 
-        sampled_proposals = proposals[sampled]       # (S, 6)
+        sampled_proposals = proposals[sampled]       # (S, 6) — GPU, нужен для forward
         sampled_labels    = labels[sampled].float()  # (S,)
         sampled_reg_tgt   = reg_targets[sampled]     # (S, 6)
         S                 = len(sampled)
-        device            = points.device
 
-        # Per-proposal sampling — O(N_points) alloc per step, NOT O(S * N)
-        pts_list = _subsample_points_loss(
-            points, sampled_proposals, n=_MAX_POINTS_PER_BOX
-        )
+        # ── CPU offload: сэмплинг точек полностью на CPU ──
+        points_cpu    = points.cpu()
+        proposals_cpu = sampled_proposals.cpu()
+        pts_list_cpu  = _subsample_points_loss(
+            points_cpu, proposals_cpu, n=_MAX_POINTS_PER_BOX
+        )  # list[CPU Tensor] — вся в RAM, VRAM не занята
 
-        # Chunked stage2 forward to keep gradient graph size bounded
+        # ── Chunked forward: грузим чанк на GPU, считаем, освобождаем ──
         fwd_chunk = self._s2_fwd_chunk
         all_cls: list[Tensor] = []
         all_reg: list[Tensor] = []
 
         for start in range(0, S, fwd_chunk):
-            end       = min(start + fwd_chunk, S)
-            chunk_pts = pts_list[start:end]
-            chunk_prp = sampled_proposals[start:end]
+            end = min(start + fwd_chunk, S)
+
+            # Грузим только текущий чанк точек на GPU
+            chunk_pts = [
+                p.to(device, non_blocking=True)
+                for p in pts_list_cpu[start:end]
+            ]
+            chunk_prp = sampled_proposals[start:end]  # срез уже на GPU
+
             with torch.autocast(device_type=self._amp_device_type):
                 c, r = self.stage2(chunk_pts, chunk_prp)
             all_cls.append(c.float())
             all_reg.append(r.float())
-            # Release cached allocator blocks so next chunk starts fresh
+
+            # Освобождаем фрагментированные блоки CUDA-аллокатора
             if self._cuda:
                 torch.cuda.empty_cache()
 
