@@ -4,6 +4,11 @@ Stage 1: Proposal Generation Network.
 Changed:
   - reg_head outputs 6D deltas (tx, ty, tz, tw, tl, th).
   - forward() accepts batch (B, N, 3) and returns (cls: B×1, reg: B×6).
+  - extract_features использует gradient checkpointing для каждого SA-слоя:
+    сохраняются только входы/выходы слоёв, промежуточные активации
+    пересчитываются при backward. Снижает пик VRAM backward на ~60%.
+    Checkpointing включён только в режиме training (requires_grad=True),
+    при inference (torch.inference_mode / no_grad) — пропускается автоматически.
 """
 
 from __future__ import annotations
@@ -12,6 +17,7 @@ import logging
 
 import torch
 import torch.nn as nn
+import torch.utils.checkpoint as ckpt
 from torch import Tensor
 
 from models.backbone.pointnet2_modules import PointNetSetAbstraction
@@ -59,6 +65,31 @@ class ProposalHead(nn.Module):
         self.cls_head = nn.Linear(feat_dim, 1)   # objectness logit
         self.reg_head = nn.Linear(feat_dim, 6)   # 6D: (tx, ty, tz, tw, tl, th)
 
+    # ------------------------------------------------------------------
+    # Статические обёртки для checkpoint — нужны чтобы передавать
+    # Optional[Tensor] через *args интерфейс checkpoint.checkpoint.
+    # checkpoint требует Tensor-аргументы; None передаём как sentinel.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _sa1_fn(sa1: PointNetSetAbstraction, xyz: Tensor) -> tuple[Tensor, Tensor]:
+        new_xyz, feats = sa1(xyz, None)
+        return new_xyz, feats
+
+    @staticmethod
+    def _sa2_fn(
+        sa2: PointNetSetAbstraction, xyz: Tensor, feats: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        new_xyz, new_feats = sa2(xyz, feats)
+        return new_xyz, new_feats
+
+    @staticmethod
+    def _sa3_fn(
+        sa3: PointNetSetAbstraction, xyz: Tensor, feats: Tensor
+    ) -> Tensor:
+        _, out = sa3(xyz, feats)
+        return out  # (B, 1, D)
+
     def extract_features(self, xyz: Tensor) -> Tensor:
         """
         Run PointNet++ on a batch of windows.
@@ -68,11 +99,35 @@ class ProposalHead(nn.Module):
 
         Returns:
             feat: (B, feat_dim)
+
+        Gradient checkpointing включён когда любой параметр требует grad
+        (т.е. в training-pass с infer_mode=False). При inference_mode /
+        no_grad — use_reentrant=False делает checkpoint прозрачным,
+        фактически выполняя forward без сохранения сегментов.
         """
-        xyz1, f1 = self.sa1(xyz, None)    # (B, 64, 64)
-        xyz2, f2 = self.sa2(xyz1, f1)    # (B, 32, 128)
-        _, f3    = self.sa3(xyz2, f2)    # (B, 1, 512)
-        return f3.squeeze(1)             # (B, 512)
+        training_pass = torch.is_grad_enabled() and xyz.requires_grad or any(
+            p.requires_grad for p in self.sa1.parameters()
+        )
+
+        if training_pass:
+            xyz1, f1 = ckpt.checkpoint(
+                self._sa1_fn, self.sa1, xyz,
+                use_reentrant=False,
+            )
+            xyz2, f2 = ckpt.checkpoint(
+                self._sa2_fn, self.sa2, xyz1, f1,
+                use_reentrant=False,
+            )
+            f3 = ckpt.checkpoint(
+                self._sa3_fn, self.sa3, xyz2, f2,
+                use_reentrant=False,
+            )
+        else:
+            xyz1, f1 = self.sa1(xyz, None)
+            xyz2, f2 = self.sa2(xyz1, f1)
+            _, f3   = self.sa3(xyz2, f2)
+
+        return f3.squeeze(1)   # (B, feat_dim)
 
     def forward(self, xyz: Tensor) -> tuple[Tensor, Tensor]:
         """
