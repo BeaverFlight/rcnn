@@ -113,7 +113,7 @@ def save_checkpoint(
     best_score: float,
     path: Path,
     cfg=None,
-    scaler: torch.cuda.amp.GradScaler | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> None:
     payload = {
         "epoch":                epoch,
@@ -134,7 +134,7 @@ def load_checkpoint(
     optimizer: torch.optim.Optimizer,
     path: Path,
     device: torch.device,
-    scaler: torch.cuda.amp.GradScaler | None = None,
+    scaler: torch.amp.GradScaler | None = None,
 ) -> tuple[int, float]:
     ckpt = torch.load(str(path), map_location=device)
 
@@ -172,7 +172,6 @@ def _evaluate_fold(
     model.eval()
     results: list[PlotMetrics] = []
 
-    # inference_mode: disables autograd bookkeeping entirely — faster than no_grad
     with torch.inference_mode():
         for sample in val_ds:
             points       = sample["points"].to(device)
@@ -268,16 +267,15 @@ def train_fold(
     )
 
     # ------------------------------------------------------------------
-    # AMP setup
-    # amp=True by default on CUDA, always False on CPU (autocast on CPU
-    # exists but GradScaler is a no-op and autocast offers little benefit
-    # for PointNet-style models without tensor cores).
+    # AMP: use new torch.amp.GradScaler API (torch.cuda.amp.GradScaler
+    # was deprecated in PyTorch 2.3).
+    # Disabled automatically on CPU — GradScaler requires device_type='cuda'.
     # ------------------------------------------------------------------
     use_amp: bool = (
         device.type == "cuda"
         and bool(cfg.training.get("amp", True))
     )
-    scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+    scaler = torch.amp.GradScaler(device.type, enabled=use_amp)
     if use_amp:
         logger.info("AMP enabled (autocast + GradScaler).")
     else:
@@ -327,9 +325,8 @@ def train_fold(
             gt_boxes     = gt_boxes.to(device, non_blocking=True)
             local_maxima = local_maxima.to(device, non_blocking=True)
 
-            optimizer.zero_grad(set_to_none=True)   # faster than zero_grad()
+            optimizer.zero_grad(set_to_none=True)
 
-            # ---- forward (autocast wraps NN layers inside the model) ----
             loss_dict  = model(points, gt_boxes, local_maxima, plot_bounds, training=True)
             total_loss: torch.Tensor = loss_dict["total_loss"]
 
@@ -342,9 +339,8 @@ def train_fold(
                 optimizer.zero_grad(set_to_none=True)
                 continue
 
-            # ---- backward + optimizer step with GradScaler -------------
             scaler.scale(total_loss).backward()
-            scaler.unscale_(optimizer)   # unscale before clip
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
             scaler.step(optimizer)
             scaler.update()
@@ -409,7 +405,6 @@ def train_fold(
                 shutil.copy2(epoch_json, best_json)
                 logger.info("  ★ New best! F1=%.4f — best.pth", best_score)
 
-            # Restore train mode after validation
             model.train()
 
 
