@@ -1,10 +1,12 @@
 """
 Stage 2: Multi-position feature extraction for proposal refinement.
 
-Fixes vs original:
-  - Добавлен forward_batch(xyz_batch, proposals_batch) для обработки
-    нескольких proposals одним GPU-вызовом вместо Python-цикла.
-  - forward() теперь вызывает forward_batch для единственного proposal.
+Memory fix:
+  - Убраны 4 вызова xyz_batch.clone() в forward_batch — они создавали
+    4 полных копии (B, N, 3) на GPU одновременно (до 6+ GB при chunk=256).
+    Теперь смещения вычисляются без clone через вычитание precomputed
+    offset тензора shape (B, 1, 2), который broadcast по N.
+  - forward() по-прежнему вызывает forward_batch.
 """
 
 from __future__ import annotations
@@ -73,38 +75,49 @@ class MultiPositionExtractor(nn.Module):
             feats: (B, feat_dim)
         """
         B, N, _ = xyz_batch.shape
-        x  = proposals[:, 0]  # (B,)
-        y  = proposals[:, 1]
-        w  = proposals[:, 3]
+        device = xyz_batch.device
 
-        # Центро-нормализация: (B, N, 3)
-        centre_pts = xyz_batch.clone()
-        centre_pts[:, :, 0] -= x.unsqueeze(1)
-        centre_pts[:, :, 1] -= y.unsqueeze(1)
-        xyz_norm = centre_pts  # (B, N, 3)
+        x = proposals[:, 0]   # (B,)
+        y = proposals[:, 1]
+        w = proposals[:, 3]
 
-        # 4 смещённые нормализации → (B, N, 12)
-        offsets_xy = [
-            torch.stack([ x + w / 2,  y         ], dim=-1),  # (B, 2)
-            torch.stack([ x - w / 2,  y         ], dim=-1),
-            torch.stack([ x,          y + w / 2 ], dim=-1),
-            torch.stack([ x,          y - w / 2 ], dim=-1),
-        ]
-        offset_parts = []
-        for oxy in offsets_xy:
-            op = xyz_batch.clone()
-            op[:, :, 0] -= oxy[:, 0:1]
-            op[:, :, 1] -= oxy[:, 1:2]
-            offset_parts.append(op)
-        offset_feat = torch.cat(offset_parts, dim=-1)  # (B, N, 12)
+        # --- Центро-нормализация без clone ---
+        # xy_centre: (B, 1, 2) → broadcast вычитается по всем N точкам
+        xy_centre = torch.stack([x, y], dim=-1).unsqueeze(1)  # (B, 1, 2)
+        xyz_norm = xyz_batch.clone()                          # (B, N, 3) — единственный clone
+        xyz_norm[:, :, :2] -= xy_centre                       # inplace, нет лишних аллокаций
+
+        # --- 4 смещённые нормализации без clone ---
+        # Вычисляем 4 offset-центра: (B, 4, 2)
+        hw = w / 2  # (B,)
+        # offsets: [[x+hw, y], [x-hw, y], [x, y+hw], [x, y-hw]]
+        offsets = torch.stack([
+            torch.stack([x + hw, y     ], dim=-1),
+            torch.stack([x - hw, y     ], dim=-1),
+            torch.stack([x,      y + hw], dim=-1),
+            torch.stack([x,      y - hw], dim=-1),
+        ], dim=1)  # (B, 4, 2)
+
+        # xyz_batch[:, :, :2]: (B, N, 2)
+        # offsets.unsqueeze(2): (B, 4, 1, 2)
+        # diff: (B, 4, N, 2) — broadcasting, нет clone
+        xy_pts = xyz_batch[:, :, :2].unsqueeze(1)          # (B, 1, N, 2)
+        dxy    = xy_pts - offsets.unsqueeze(2)             # (B, 4, N, 2)  broadcast
+        z_rep  = xyz_batch[:, :, 2:].unsqueeze(1).expand(
+            B, 4, N, 1
+        )                                                  # (B, 4, N, 1)
+        offset_4d = torch.cat([dxy, z_rep], dim=-1)        # (B, 4, N, 3)
+
+        # Reshape → (B, N, 12) без дополнительных копий
+        offset_feat = offset_4d.permute(0, 2, 1, 3).reshape(B, N, 12)  # (B, N, 12)
 
         xyz1, f1 = self.sa1(xyz_norm, offset_feat)    # (B, S1, 64)
         xyz2, f2 = self.sa2(xyz1, f1)                 # (B, S2, 128)
-        _, f3    = self.sa3(xyz2, f2)                 # (B, 1, 512)
+        _,    f3 = self.sa3(xyz2, f2)                 # (B, 1,  D)
         return f3.squeeze(1)                           # (B, feat_dim)
 
     # ------------------------------------------------------------------
-    # Single-proposal interface (используется снаружи если нужно)
+    # Single-proposal interface
     # ------------------------------------------------------------------
     def forward(self, points: Tensor, proposal: Tensor) -> Tensor:
         """

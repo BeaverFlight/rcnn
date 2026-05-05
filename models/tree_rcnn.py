@@ -14,6 +14,8 @@ Memory strategy:
       5. torch.cuda.empty_cache() между чанками.
   - Stage-2 inference: _subsample_points_batch_proposals — chunked broadcast,
     безопасен под torch.inference_mode и меньших proposal наборах.
+  - _stage1_loss_with_cache: явный del исходных тензоров с grad-графом
+    сразу после .detach().clone() — освобождает граф до clone.
 """
 
 from __future__ import annotations
@@ -92,7 +94,7 @@ def _subsample_points_loss(
         )
         inside = points_cpu[mask]
         if len(inside) > n:
-            perm   = torch.randperm(len(inside))[:n]  # CPU randperm — no CUDA alloc
+            perm   = torch.randperm(len(inside))[:n]
             inside = inside[perm]
         result.append(inside)
     return result
@@ -265,7 +267,7 @@ def _pad_windows_to_batch(
     )
 
     ones    = torch.ones(total, dtype=torch.long, device=device)
-    cum     = torch.cumsum(ones, 0) - 1
+            cum     = torch.cumsum(ones, 0) - 1
     is_new  = torch.cat([
         torch.ones(1, dtype=torch.bool, device=device),
         win_ids[1:] != win_ids[:-1],
@@ -390,9 +392,13 @@ class TreeRCNN(nn.Module):
         cfg_la      = self.cfg.label_assignment
 
         with torch.inference_mode():
-            all_cls, all_reg = self._run_stage1_on_anchors(points, all_anchors, infer_mode=True, tag="s1_scan")
-        all_cls = all_cls.detach().clone()
-        all_reg = all_reg.detach().clone()
+            _cls_raw, _reg_raw = self._run_stage1_on_anchors(
+                points, all_anchors, infer_mode=True, tag="s1_scan"
+            )
+        # Явный del до clone — освобождает grad-граф (если он есть) немедленно
+        all_cls = _cls_raw.detach().clone()
+        all_reg = _reg_raw.detach().clone()
+        del _cls_raw, _reg_raw
         cls_scores_all = torch.sigmoid(all_cls.squeeze(-1))
 
         labels, reg_targets, _, sampled = assign_targets(
@@ -549,7 +555,7 @@ class TreeRCNN(nn.Module):
           2. pts_list — список CPU-тензоров, хранится в RAM.
           3. В цикле forward текущий чанк грузится на GPU:
                [p.to(device) for p in pts_list[start:end]]
-             Пиковая VRAM от pts = chunk * max_pts * 3 * fp16 ≈ 1.5 MB.
+             Пиковая VRAM от pts = chunk_size * max_pts * 3 * fp16 ≈ 1.5 MB.
           4. torch.cuda.empty_cache() между чанками.
         """
         cfg_la = self.cfg.label_assignment
@@ -584,19 +590,17 @@ class TreeRCNN(nn.Module):
         for start in range(0, S, fwd_chunk):
             end = min(start + fwd_chunk, S)
 
-            # Грузим только текущий чанк точек на GPU
             chunk_pts = [
                 p.to(device, non_blocking=True)
                 for p in pts_list_cpu[start:end]
             ]
-            chunk_prp = sampled_proposals[start:end]  # срез уже на GPU
+            chunk_prp = sampled_proposals[start:end]
 
             with torch.autocast(device_type=self._amp_device_type):
                 c, r = self.stage2(chunk_pts, chunk_prp)
             all_cls.append(c.float())
             all_reg.append(r.float())
 
-            # Освобождаем фрагментированные блоки CUDA-аллокатора
             if self._cuda:
                 torch.cuda.empty_cache()
 
