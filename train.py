@@ -14,6 +14,8 @@ quality_score = harmonic_mean(precision, recall)
 Changes:
   - model.set_epoch(epoch) called each epoch for two-phase freeze policy.
   - AdamW added as optimizer option (was missing despite being in config).
+  - load_checkpoint uses strict=False to handle 4D→6D reg_head mismatch;
+    mismatched layers are re-initialised from scratch, rest is restored.
 """
 
 from __future__ import annotations
@@ -137,10 +139,38 @@ def load_checkpoint(
     device: torch.device,
 ) -> tuple[int, float]:
     ckpt = torch.load(str(path), map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"])
-    optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+
+    # strict=False: mismatched layers (e.g. reg_head 4D→6D) are skipped and
+    # left with their fresh random init; all other weights are restored.
+    missing, unexpected = model.load_state_dict(
+        ckpt["model_state_dict"], strict=False
+    )
+    if missing:
+        logger.warning(
+            "load_checkpoint: %d missing keys (re-initialised from scratch): %s",
+            len(missing), missing,
+        )
+    if unexpected:
+        logger.warning(
+            "load_checkpoint: %d unexpected keys (ignored): %s",
+            len(unexpected), unexpected,
+        )
+
+    # Optimizer state may be incompatible when model params changed shape.
+    # Try to restore; if it fails, start optimizer fresh (loss of momentum
+    # state only — model weights are already loaded above).
+    try:
+        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+    except (ValueError, KeyError) as exc:
+        logger.warning(
+            "load_checkpoint: optimizer state incompatible (%s) — "
+            "starting optimizer from scratch.", exc,
+        )
+
     score = ckpt.get("best_score", ckpt.get("best_rms", 0.0))
-    logger.info("Resumed from %s (epoch %d, best_score=%.4f)", path, ckpt["epoch"], score)
+    logger.info(
+        "Resumed from %s (epoch %d, best_score=%.4f)", path, ckpt["epoch"], score
+    )
     return ckpt["epoch"], score
 
 
