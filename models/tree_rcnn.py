@@ -8,6 +8,9 @@ Performance changes vs previous version:
   4. Vectorised _subsample_points_batch: mask built fully on GPU via scatter.
   5. Vectorised _pad_windows_to_batch: Python loop replaced with
      scatter_add into pre-allocated [B, max_n, 3] tensor on GPU.
+  6. _stage2_loss: Python per-proposal loop replaced with
+     _subsample_points_batch_proposals + chunked stage2 forward
+     to avoid OOM when n_positive+n_negative is large.
 """
 
 from __future__ import annotations
@@ -188,7 +191,7 @@ def _subsample_points_batch_proposals(
             total_kept        += len(grp)
             result[start + i]  = points[grp].clone()
 
-        logger.info(
+        logger.debug(
             "  Chunk %d/%d (props %d-%d): non_empty=%d kept=%d %.2fs",
             chunk_idx, total_chunks, start, end - 1,
             non_empty, total_kept, time.perf_counter() - t_c,
@@ -214,20 +217,17 @@ def _pad_windows_to_batch(
 
     valid_pts = [pts_list[i] for i in valid_idx]
     B         = len(valid_pts)
-    counts    = [p.shape[0] for p in valid_pts]  # per-window point counts
+    counts    = [p.shape[0] for p in valid_pts]
     max_n     = max(counts)
 
-    # Concatenate all points: (total_pts, 3)
-    all_pts = torch.cat(valid_pts, dim=0)         # (sum_counts, 3)
+    all_pts = torch.cat(valid_pts, dim=0)
     total   = all_pts.shape[0]
 
-    # Window index for every point
     win_ids = torch.repeat_interleave(
         torch.arange(B, device=device),
         torch.tensor(counts, device=device),
-    )  # (total_pts,)
+    )
 
-    # Local index within window (0, 1, 2, ... per window)
     ones    = torch.ones(total, dtype=torch.long, device=device)
     cum     = torch.cumsum(ones, 0) - 1
     is_new  = torch.cat([
@@ -237,24 +237,17 @@ def _pad_windows_to_batch(
     starts  = torch.zeros(total, dtype=torch.long, device=device)
     starts[is_new] = cum[is_new]
     starts  = torch.cummax(starts, dim=0).values
-    loc_idx = cum - starts  # local position within window
+    loc_idx = cum - starts
 
-    # If window has fewer points than max_n, tile by repeating
-    # (handled implicitly: we only scatter real points; zeros fill the rest)
-    # For windows shorter than max_n we need to tile — compute tiled indices.
-    # Simple approach: build expanded win_ids / loc_idx by tiling short windows.
-    counts_t  = torch.tensor(counts, dtype=torch.long, device=device)  # (B,)
-    # For each window compute how many times to repeat to reach max_n
-    reps      = (max_n + counts_t - 1) // counts_t  # ceil division
-    # Expand: repeat each window's points reps[w] times, then slice to max_n
-    # Build per-window tiled tensors efficiently:
+    counts_t  = torch.tensor(counts, dtype=torch.long, device=device)
+    reps      = (max_n + counts_t - 1) // counts_t
     tiled_parts: list[Tensor] = []
     for k in range(B):
         p = valid_pts[k]
         r = int(reps[k].item())
         tiled_parts.append(p.repeat(r, 1)[:max_n])
 
-    batched = torch.stack(tiled_parts, dim=0)  # (B, max_n, 3)
+    batched = torch.stack(tiled_parts, dim=0)
     return batched, valid_idx
 
 
@@ -275,7 +268,8 @@ class TreeRCNN(nn.Module):
         self._focal_alpha: float = float(fl.get("alpha", 0.25) if fl else 0.25)
         self._focal_gamma: float = float(fl.get("gamma", 2.0)  if fl else 2.0)
 
-        self._s2_chunk: int         = int(cfg.training.get("stage2_infer_chunk", _STAGE2_INFER_CHUNK))
+        self._s2_chunk: int         = int(cfg.training.get("stage2_infer_chunk",   _STAGE2_INFER_CHUNK))
+        self._s2_fwd_chunk: int     = int(cfg.training.get("stage2_forward_chunk", 256))
         self._freeze_s2_epochs: int = int(cfg.training.get("freeze_stage2_epochs", 0))
         self._current_epoch: int    = 0
         self._amp_device_type: str  = "cpu"
@@ -509,7 +503,14 @@ class TreeRCNN(nn.Module):
     # Stage 2
     # ------------------------------------------------------------------
 
-    def _stage2_loss(self, points, proposals, gt_boxes):
+    def _stage2_loss(self, points: Tensor, proposals: Tensor, gt_boxes: Tensor) -> dict:
+        """
+        Stage-2 training loss.
+
+        Points are sampled with _subsample_points_batch_proposals (vectorised,
+        no Python loop over proposals). The stage2 forward is then split into
+        chunks of size stage2_forward_chunk to avoid OOM on large n_pos+n_neg.
+        """
         cfg_la = self.cfg.label_assignment
         labels, reg_targets, _, sampled = assign_targets(
             proposals, gt_boxes,
@@ -519,26 +520,50 @@ class TreeRCNN(nn.Module):
             n_pos=self.cfg.training.n_positive,
             n_neg=self.cfg.training.n_negative,
         )
-        pts_list = [_subsample_points_in_box(points, p) for p in proposals[sampled]]
 
-        with torch.autocast(device_type=self._amp_device_type):
-            cls_logits, reg_deltas = self.stage2(pts_list, proposals[sampled])
-        cls_logits = cls_logits.float()
-        reg_deltas = reg_deltas.float()
+        sampled_proposals = proposals[sampled]       # (S, 6)
+        sampled_labels    = labels[sampled].float()  # (S,)
+        sampled_reg_tgt   = reg_targets[sampled]     # (S, 6)
+        S                 = len(sampled)
+        device            = points.device
 
-        sampled_labels = labels[sampled].float()
-        cls_loss = sigmoid_focal_loss(cls_logits.squeeze(-1), sampled_labels,
-                                      alpha=self._focal_alpha, gamma=self._focal_gamma)
+        # Vectorised point sampling for all sampled proposals at once
+        fwd_chunk = self._s2_fwd_chunk
+        pts_list  = _subsample_points_batch_proposals(
+            points, sampled_proposals,
+            n=_MAX_POINTS_PER_BOX,
+            chunk=fwd_chunk,
+        )
+
+        # Chunked forward through stage2 to bound peak VRAM
+        all_cls: list[Tensor] = []
+        all_reg: list[Tensor] = []
+        for start in range(0, S, fwd_chunk):
+            end       = min(start + fwd_chunk, S)
+            chunk_pts = pts_list[start:end]
+            chunk_prp = sampled_proposals[start:end]
+            with torch.autocast(device_type=self._amp_device_type):
+                c, r = self.stage2(chunk_pts, chunk_prp)
+            all_cls.append(c.float())
+            all_reg.append(r.float())
+
+        cls_logits = torch.cat(all_cls, dim=0)  # (S, 1)
+        reg_deltas = torch.cat(all_reg, dim=0)  # (S, 6)
+
+        cls_loss = sigmoid_focal_loss(
+            cls_logits.squeeze(-1), sampled_labels,
+            alpha=self._focal_alpha, gamma=self._focal_gamma,
+        )
         pos_mask = sampled_labels == 1
         reg_loss = (
-            smooth_l1_loss(reg_deltas[pos_mask], reg_targets[sampled][pos_mask])
-            if pos_mask.any() else torch.tensor(0.0, device=points.device)
+            smooth_l1_loss(reg_deltas[pos_mask], sampled_reg_tgt[pos_mask])
+            if pos_mask.any() else torch.tensor(0.0, device=device)
         )
         total = cls_loss + self.lambda_reg * reg_loss
         return {"loss_stage2_cls": cls_loss, "loss_stage2_reg": reg_loss,
                 "total_loss_stage2": total}
 
-    def _stage2_inference(self, points, proposals):
+    def _stage2_inference(self, points: Tensor, proposals: Tensor):
         cfg_nms  = self.cfg.stage2_nms
         t_s      = time.perf_counter()
         pts_list = _subsample_points_batch_proposals(
