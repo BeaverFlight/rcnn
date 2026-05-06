@@ -9,8 +9,19 @@ API:
     # внутри train-цикла:
     advisor.push(epoch, loss_dict, metrics=None)
 
+    # когда пользователь реально применил совет:
+    advisor.confirm_applied(action)        # ← NEW: только теперь пишем в DB
+
     # после завершения обучения:
     advisor.finalize()                     # постоянный отчёт + сохранение DB
+
+Fix:
+    advise() больше НЕ пишет pending-записи автоматически.
+    Запись создаётся только в confirm_applied(action), который
+    вызывается явно когда гиперпараметр реально изменён.
+    Это устраняет ложные корреляции в ExperienceDB: раньше
+    проигнорированный совет давал delta_f1 = (естественный рост F1
+    за следующую эпоху), что портило обучение UCB1-Learner'а.
 """
 from __future__ import annotations
 
@@ -34,8 +45,8 @@ _LEVEL_ORDER  = {"critical": 0, "warning": 1, "learned": 2, "info": 3, "ok": 4}
 class TrainingAdvisor:
     """
     Анализирует ход обучения, систему и данные.
-    Самообучается: записывает опыты в ExperienceDB и генерирует
-    советы через BayesianAdvisorLearner (UCB1 по гиперпараметрам).
+    Самообучается: записывает опыты в ExperienceDB ТОЛЬКО после
+    явного вызова confirm_applied(action).
 
     Parameters
     ----------
@@ -59,7 +70,6 @@ class TrainingAdvisor:
         self._tracker   = LossTracker(window=window)
         self._report_interval = report_interval
 
-        # ExperienceDB — персистентная БД опытов
         if db_path is None:
             db_path = Path(data_root) / "advisor_db.json"
         self._db      = ExperienceDB(db_path)
@@ -68,10 +78,12 @@ class TrainingAdvisor:
         self._sys:  Optional[SystemSnapshot] = None
         self._data: Optional[DatasetStats]   = None
 
-        # Отслеживание состояния для записи опытов
-        self._last_f1:      float = 0.0
-        self._last_epoch:   int   = 0
-        self._pending_actions: dict[str, float] = {}  # action_key → f1_before
+        self._last_f1:    float = 0.0
+        self._last_epoch: int   = 0
+
+        # pending_actions: action_key → f1_before
+        # Заполняется ТОЛЬКО через confirm_applied(), НЕ через advise().
+        self._pending_actions: dict[str, float] = {}
 
     # ------------------------------------------------------------------
     # Probing
@@ -116,13 +128,12 @@ class TrainingAdvisor:
 
         f1 = metrics.get("f1") if metrics else None
         if f1 is not None:
-            # Финализируем pending опыты
+            # Финализируем ТОЛЬКО те pending, которые были подтверждены
             for key in list(self._pending_actions.keys()):
                 self._learner.update_f1_after(key, float(f1))
             self._pending_actions.clear()
             self._last_f1 = float(f1)
 
-        # Автоматический периодический репорт
         if (
             self._report_interval > 0
             and epoch > 0
@@ -131,12 +142,57 @@ class TrainingAdvisor:
             self.refresh_system()
             self._log_advices(epoch)
 
+    def confirm_applied(self, action: dict) -> None:
+        """
+        Вызывать ТОЛЬКО когда пользователь реально применил совет
+        (изменил конфиг или явно согласился).
+
+        Создаёт pending-запись в ExperienceDB. Запись будет финализирована
+        на следующем push() с метриками (следующая валидация).
+
+        Parameters
+        ----------
+        action : dict  — {action_key: new_value}, как в Advice.action
+
+        Пример
+        ------
+        advices = advisor.advise()
+        for a in advices:
+            # ... показать пользователю ...
+            if user_confirms(a):
+                apply_to_cfg(a.action)
+                advisor.confirm_applied(a.action)   # ← только здесь
+        """
+        la = self._tracker.analyse()
+        self._learner.record_action(
+            epoch         = self._last_epoch,
+            action        = action,
+            cfg           = self._cfg,
+            f1_before     = self._last_f1,
+            loss_analysis = la,
+        )
+        for key in action:
+            self._pending_actions[key] = self._last_f1
+        logger.info(
+            "[Advisor] confirm_applied: %s (f1_before=%.4f, epoch=%d)",
+            action, self._last_f1, self._last_epoch,
+        )
+
     # ------------------------------------------------------------------
     # Advice generation (rules + learned)
+    # NOTE: advise() больше НЕ пишет в ExperienceDB.
+    #       Используй confirm_applied(a.action) после явного применения.
     # ------------------------------------------------------------------
 
     def advise(self) -> list[Advice]:
-        la      = self._tracker.analyse()
+        """
+        Генерирует и возвращает список советов.
+
+        НЕ записывает ничего в ExperienceDB.
+        Чтобы зафиксировать применение совета — вызови
+        confirm_applied(advice.action) явно.
+        """
+        la = self._tracker.analyse()
         rule_advices = generate_advices(
             sys_snap      = self.system,
             data_stats    = self.data,
@@ -148,23 +204,7 @@ class TrainingAdvisor:
             current_f1    = self._last_f1,
             loss_analysis = la,
         )
-
-        # Записываем recommended actions как pending опыты
-        all_advices = rule_advices + learned_advices
-        for a in all_advices:
-            if a.action and a.level in ("critical", "warning"):
-                la_now = self._tracker.analyse()
-                self._learner.record_action(
-                    epoch         = self._last_epoch,
-                    action        = a.action,
-                    cfg           = self._cfg,
-                    f1_before     = self._last_f1,
-                    loss_analysis = la_now,
-                )
-                for key in a.action:
-                    self._pending_actions[key] = self._last_f1
-
-        return all_advices
+        return rule_advices + learned_advices
 
     def _log_advices(self, epoch: int) -> None:
         advices = self.advise()
@@ -179,14 +219,19 @@ class TrainingAdvisor:
                 logger.info("    → %s", a.action)
 
     # ------------------------------------------------------------------
-    # Finalize (вызывать после окончания обучения)
+    # Finalize
     # ------------------------------------------------------------------
 
     def finalize(self) -> None:
         """
         Постоянный отчёт + Learner-аналитика.
-        Вызывать в конце train_fold().
+        Если есть незакрытые pending — логируем предупреждение.
         """
+        if self._pending_actions:
+            logger.warning(
+                "[Advisor] finalize: есть %d pending действий без f1_after: %s",
+                len(self._pending_actions), list(self._pending_actions.keys())
+            )
         self.refresh_system()
         self.report()
         print(self._learner.post_training_report())
@@ -270,7 +315,6 @@ class TrainingAdvisor:
                 bar = int(v / total * 20) if total > 0 else 0
                 print(f"    {k:<35} {v:.4f}  {'|'*bar}")
 
-        # Learner summary
         summary = self._db.summary()
         if summary:
             print("\n🧠  LEARNER (накопленный опыт):")
@@ -366,7 +410,7 @@ class TrainingAdvisor:
 </table>
 {f'''
 <hr style="margin:6px 0">
-<b>🧠 Learner (топ-5 гипперпараметров):</b>
+<b>🧠 Learner (топ-5 гиперпараметров):</b>
 <table style="width:100%;font-size:12px;margin-top:4px">
 <tr><th align=left>Key</th><th>n</th><th>mean ΔF1</th><th>pos%</th></tr>
 {learner_rows}
