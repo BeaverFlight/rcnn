@@ -1,27 +1,22 @@
 """
-advisor/advisor.py — главный класс (v2: самообучающийся)
+advisor/advisor.py — главный класс (v2: самообучающийся + ConfigWatcher)
 
 API:
     advisor = TrainingAdvisor(cfg, data_root)
-    advisor.report()                       # начальный отчёт в stdout
-    advisor.report_jupyter()               # HTML в Jupyter
+    advisor.report()                             # начальный отчёт в stdout
+    advisor.report_jupyter()                     # HTML в Jupyter
 
     # внутри train-цикла:
-    advisor.push(epoch, loss_dict, metrics=None)
-
-    # когда пользователь реально применил совет:
-    advisor.confirm_applied(action)        # ← NEW: только теперь пишем в DB
+    advisor.push(epoch, loss_dict, metrics=None) # каждую эпоху
 
     # после завершения обучения:
-    advisor.finalize()                     # постоянный отчёт + сохранение DB
+    advisor.finalize()                           # постоянный отчёт + сохранение DB
 
-Fix:
-    advise() больше НЕ пишет pending-записи автоматически.
-    Запись создаётся только в confirm_applied(action), который
-    вызывается явно когда гиперпараметр реально изменён.
-    Это устраняет ложные корреляции в ExperienceDB: раньше
-    проигнорированный совет давал delta_f1 = (естественный рост F1
-    за следующую эпоху), что портило обучение UCB1-Learner'а.
+Как теперь работает подтверждение:
+  ConfigWatcher каждую эпоху сравнивает конфиг с предыдущей эпохой.
+  Если что-то изменилось — это считается "применённым действием" и
+  автоматически создаётся pending-запись в ExperienceDB.
+  Никакого ручного confirm_applied() не нужно.
 """
 from __future__ import annotations
 
@@ -35,6 +30,7 @@ from advisor.loss_tracker  import LossTracker, LossAnalysis
 from advisor.rules         import generate_advices, Advice
 from advisor.experience_db import ExperienceDB
 from advisor.learner       import BayesianAdvisorLearner
+from advisor.config_watcher import ConfigWatcher, ChangedParam
 
 logger = logging.getLogger(__name__)
 
@@ -45,8 +41,12 @@ _LEVEL_ORDER  = {"critical": 0, "warning": 1, "learned": 2, "info": 3, "ok": 4}
 class TrainingAdvisor:
     """
     Анализирует ход обучения, систему и данные.
-    Самообучается: записывает опыты в ExperienceDB ТОЛЬКО после
-    явного вызова confirm_applied(action).
+    Самообучается: записывает опыты в ExperienceDB и генерирует
+    советы через BayesianAdvisorLearner (UCB1 по гиперпараметрам).
+
+    Изменения конфига детектируются автоматически через ConfigWatcher:
+    каждую эпоху push() сравнивает конфиг с предыдущим снапшотом и
+    создаёт pending-запись в ExperienceDB без ручного вмешательства.
 
     Parameters
     ----------
@@ -55,6 +55,7 @@ class TrainingAdvisor:
     db_path          : путь к JSON-базе опытов (None → <data_root>/advisor_db.json)
     window           : длина окна для trend-анализа loss
     report_interval  : каждые N эпох логировать советы (0 = никогда)
+    watch_prefix     : какие ключи конфига отслеживать (default='training')
     """
 
     def __init__(
@@ -64,6 +65,7 @@ class TrainingAdvisor:
         db_path: Optional[str | Path] = None,
         window: int = 50,
         report_interval: int = 0,
+        watch_prefix: str = "training",
     ) -> None:
         self._cfg       = cfg
         self._data_root = str(data_root)
@@ -74,15 +76,15 @@ class TrainingAdvisor:
             db_path = Path(data_root) / "advisor_db.json"
         self._db      = ExperienceDB(db_path)
         self._learner = BayesianAdvisorLearner(self._db)
+        self._watcher = ConfigWatcher(watch_prefix=watch_prefix)
 
         self._sys:  Optional[SystemSnapshot] = None
         self._data: Optional[DatasetStats]   = None
 
         self._last_f1:    float = 0.0
         self._last_epoch: int   = 0
-
         # pending_actions: action_key → f1_before
-        # Заполняется ТОЛЬКО через confirm_applied(), НЕ через advise().
+        # Заполняется ТОЛЬКО через ConfigWatcher при обнаружении реальных изменений.
         self._pending_actions: dict[str, float] = {}
 
     # ------------------------------------------------------------------
@@ -118,17 +120,62 @@ class TrainingAdvisor:
         epoch: int,
         loss_dict: dict,
         metrics: Optional[dict] = None,
-    ) -> None:
+        cfg=None,
+    ) -> list[ChangedParam]:
         """
         Вызывается каждую эпоху.
-        metrics = {'f1': 0.72, ...} — если была валидация.
+
+        Parameters
+        ----------
+        epoch     : текущая эпоха
+        loss_dict : словарь loss-компонентов из model.forward()
+        metrics   : {'f1': 0.72, ...} — если была валидация
+        cfg       : текущий конфиг (передавай чтобы детектировать изменения).
+                    Если None — ConfigWatcher пропускает снапшот.
+
+        Returns
+        -------
+        list[ChangedParam]
+            Список параметров, которые изменились в эту эпоху.
+            Пустой список если изменений нет.
         """
         self._tracker.push(epoch, loss_dict, metrics)
         self._last_epoch = epoch
 
         f1 = metrics.get("f1") if metrics else None
+        mean_loss = None
+        if loss_dict:
+            import torch
+            vals = []
+            for v in loss_dict.values():
+                try:
+                    vals.append(float(v.item()) if hasattr(v, 'item') else float(v))
+                except (TypeError, ValueError):
+                    pass
+            mean_loss = sum(vals) / len(vals) if vals else None
+
+        # --- ConfigWatcher: детектируем изменения ---
+        changed: list[ChangedParam] = []
+        if cfg is not None:
+            changed = self._watcher.snapshot(
+                cfg, epoch=epoch, f1=f1, loss=mean_loss
+            )
+            # Нашли реальные изменения → пишем pending в DB
+            la = self._tracker.analyse()
+            for cp in changed:
+                self._learner.record_action(
+                    epoch         = epoch,
+                    action        = {cp.key: cp.new_value},
+                    cfg           = cfg,
+                    f1_before     = self._last_f1,
+                    loss_analysis = la,
+                )
+                self._pending_actions[cp.key] = self._last_f1
+
         if f1 is not None:
-            # Финализируем ТОЛЬКО те pending, которые были подтверждены
+            # Обновляем watcher если f1 пришёл после snapshot
+            self._watcher.update_last_f1(f1)
+            # Финализируем pending
             for key in list(self._pending_actions.keys()):
                 self._learner.update_f1_after(key, float(f1))
             self._pending_actions.clear()
@@ -142,55 +189,18 @@ class TrainingAdvisor:
             self.refresh_system()
             self._log_advices(epoch)
 
-    def confirm_applied(self, action: dict) -> None:
-        """
-        Вызывать ТОЛЬКО когда пользователь реально применил совет
-        (изменил конфиг или явно согласился).
-
-        Создаёт pending-запись в ExperienceDB. Запись будет финализирована
-        на следующем push() с метриками (следующая валидация).
-
-        Parameters
-        ----------
-        action : dict  — {action_key: new_value}, как в Advice.action
-
-        Пример
-        ------
-        advices = advisor.advise()
-        for a in advices:
-            # ... показать пользователю ...
-            if user_confirms(a):
-                apply_to_cfg(a.action)
-                advisor.confirm_applied(a.action)   # ← только здесь
-        """
-        la = self._tracker.analyse()
-        self._learner.record_action(
-            epoch         = self._last_epoch,
-            action        = action,
-            cfg           = self._cfg,
-            f1_before     = self._last_f1,
-            loss_analysis = la,
-        )
-        for key in action:
-            self._pending_actions[key] = self._last_f1
-        logger.info(
-            "[Advisor] confirm_applied: %s (f1_before=%.4f, epoch=%d)",
-            action, self._last_f1, self._last_epoch,
-        )
+        return changed
 
     # ------------------------------------------------------------------
     # Advice generation (rules + learned)
-    # NOTE: advise() больше НЕ пишет в ExperienceDB.
-    #       Используй confirm_applied(a.action) после явного применения.
+    # NOTE: advise() НЕ пишет в ExperienceDB.
+    #       Запись происходит автоматически через ConfigWatcher в push().
     # ------------------------------------------------------------------
 
     def advise(self) -> list[Advice]:
         """
         Генерирует и возвращает список советов.
-
         НЕ записывает ничего в ExperienceDB.
-        Чтобы зафиксировать применение совета — вызови
-        confirm_applied(advice.action) явно.
         """
         la = self._tracker.analyse()
         rule_advices = generate_advices(
@@ -219,21 +229,44 @@ class TrainingAdvisor:
                 logger.info("    → %s", a.action)
 
     # ------------------------------------------------------------------
+    # Correlation / param history
+    # ------------------------------------------------------------------
+
+    def correlations(self) -> dict[str, dict]:
+        """
+        Корреляции (Pearson r) между cfg-параметрами и F1.
+        Возвращает только ключи с n_points >= 3.
+        """
+        return self._watcher.correlations()
+
+    def param_history(self, key: str):
+        """
+        История конкретного параметра:
+        [(epoch, value, f1, loss), ...]
+        """
+        return self._watcher.param_history(key)
+
+    def changes_report(self) -> str:
+        """Текстовый отчёт: какие параметры менялись и как изменился F1 после."""
+        return self._watcher.changed_params_report()
+
+    # ------------------------------------------------------------------
     # Finalize
     # ------------------------------------------------------------------
 
     def finalize(self) -> None:
         """
-        Постоянный отчёт + Learner-аналитика.
-        Если есть незакрытые pending — логируем предупреждение.
+        Постоянный отчёт + Learner-аналитика + изменения конфига.
+        Вызывать в конце train_fold().
         """
         if self._pending_actions:
             logger.warning(
-                "[Advisor] finalize: есть %d pending действий без f1_after: %s",
+                "[Advisor] finalize: есть %d pending без f1_after: %s",
                 len(self._pending_actions), list(self._pending_actions.keys())
             )
         self.refresh_system()
         self.report()
+        print(self._watcher.changed_params_report())
         print(self._learner.post_training_report())
         logger.info("[Advisor] ExperienceDB: %d записей, %s",
                     len(self._db._records), self._db._path)
@@ -325,6 +358,18 @@ class TrainingAdvisor:
                       f"ΔF1={sign}{stat['mean_df1']:+.4f}  "
                       f"pos={stat['pos_rate']:.0%}")
 
+        # Топ корреляций
+        corrs = self._watcher.correlations()
+        if corrs:
+            print("\n📐  КОРРЕЛЯЦИИ (cfg → F1):")
+            for key, info in sorted(
+                corrs.items(), key=lambda x: -abs(x[1]['pearson_r'])
+            )[:5]:
+                bar = int(abs(info['pearson_r']) * 20)
+                sign = "+" if info['pearson_r'] >= 0 else "-"
+                print(f"    {key:<40} r={sign}{abs(info['pearson_r']):.3f}  "
+                      f"{'|'*bar}  n={info['n_points']}  [{info['direction']}]")
+
     def _print_advices(self, advices: list[Advice]) -> None:
         if not advices:
             print("\n✅  Советов нет — всё в норме.")
@@ -376,6 +421,21 @@ class TrainingAdvisor:
                 f"<td>{a.text}{act}</td></tr>"
             )
 
+        # Корреляции в HTML
+        corrs = self._watcher.correlations()
+        corr_rows = ""
+        for key, info in sorted(corrs.items(), key=lambda x: -abs(x[1]['pearson_r']))[:8]:
+            sign = "+" if info['pearson_r'] >= 0 else ""
+            col  = "#44bb44" if info['direction'] == 'positive' else (
+                   "#ff6644" if info['direction'] == 'negative' else "#aaaaaa"
+            )
+            corr_rows += (
+                f"<tr><td>{key}</td>"
+                f"<td style='color:{col};font-weight:bold'>{sign}{info['pearson_r']:.3f}</td>"
+                f"<td>{info['n_points']}</td>"
+                f"<td>{info['direction']}</td></tr>"
+            )
+
         s = self.system; g = s.primary_gpu; d = self.data
         gpu_str = f"{g.name} | VRAM {g.vram_used_gb:.1f}/{g.vram_total_gb:.1f} GB" if g else "No GPU"
         summary = self._db.summary()
@@ -408,6 +468,14 @@ class TrainingAdvisor:
 <tr><th align=left>Level</th><th align=left>Category</th><th align=left>Advice</th></tr>
 {rows if rows else "<tr><td colspan=3 style='color:#44bb44'>✅ Всё в норме.</td></tr>"}
 </table>
+{f'''
+<hr style="margin:6px 0">
+<b>📐 Корреляции (cfg → F1):</b>
+<table style="width:100%;font-size:12px;margin-top:4px">
+<tr><th align=left>Key</th><th>Pearson r</th><th>n</th><th>Direction</th></tr>
+{corr_rows}
+</table>
+''' if corr_rows else ''}
 {f'''
 <hr style="margin:6px 0">
 <b>🧠 Learner (топ-5 гиперпараметров):</b>

@@ -3,19 +3,18 @@ advisor/integration.py — патчи для интеграции в train.py
 
 Изменения в train.py минимальны:
     from advisor.integration import make_advisor, advisor_push, advisor_val_push
-    from advisor.integration import advisor_confirm_applied  # ← new
 
     # до цикла
     advisor = make_advisor(cfg, data_root)
 
-    # внутри epoch-цикла
-    advisor_push(advisor, epoch, loss_dict, metrics=None)
+    # внутри epoch-цикла (передаём cfg!)
+    advisor_push(advisor, epoch, loss_dict, cfg=cfg)
 
-    # после val
-    advisor_val_push(advisor, epoch, loss_dict, score_info)
+    # после val (передаём cfg и метрики)
+    advisor_val_push(advisor, epoch, loss_dict, score_info, cfg=cfg)
 
-    # когда реально меняешь гиперпараметр по совету Advisor'а:
-    advisor_confirm_applied(advisor, a.action)
+ConfigWatcher автоматически детектирует что изменилось и пишет в DB.
+Никакого ручного confirm_applied() не нужно.
 """
 from __future__ import annotations
 
@@ -30,14 +29,16 @@ def make_advisor(
     data_root: str | Path,
     window: int = 50,
     report_interval: int = 0,
+    watch_prefix: str = "training",
 ) -> TrainingAdvisor:
     """
-    Создаёт Advisor, одновременно запуская сканирование системы и данных.
+    Создаёт Advisor с ConfigWatcher.
     Вызывать до начала цикла.
     """
     adv = TrainingAdvisor(
         cfg=cfg, data_root=data_root,
         window=window, report_interval=report_interval,
+        watch_prefix=watch_prefix,
     )
     adv.refresh_system()
     adv.refresh_data()
@@ -50,10 +51,24 @@ def advisor_push(
     epoch: int,
     loss_dict: dict,
     metrics: Optional[dict] = None,
+    cfg=None,
 ) -> None:
-    """No-op если advisor is None."""
+    """
+    Вызывать каждую эпоху.
+
+    Передавай cfg чтобы ConfigWatcher детектировал изменения.
+    Если в эту эпоху нет валидации — metrics=None.
+    """
     if advisor is not None:
-        advisor.push(epoch, loss_dict, metrics)
+        changed = advisor.push(epoch, loss_dict, metrics=metrics, cfg=cfg)
+        if changed:
+            import logging
+            log = logging.getLogger("train")
+            for cp in changed:
+                log.info(
+                    "[Advisor/Watcher] Epoch %d: обнаружено изменение %s: %s → %s",
+                    epoch, cp.key, cp.old_value, cp.new_value,
+                )
 
 
 def advisor_val_push(
@@ -61,37 +76,15 @@ def advisor_val_push(
     epoch: int,
     loss_dict: dict,
     score_info: dict,
+    cfg=None,
 ) -> None:
     """
-    Вызывается после валидации.
+    Вызывать после валидации.
     score_info — дикт из _quality_score(): содержит 'f1', 'precision', 'recall'.
+    Передавай cfg чтобы ConfigWatcher зафиксировал состояние и обновил F1.
     """
     if advisor is not None:
         metrics = {"f1": score_info.get("f1", 0.0),
                    "precision": score_info.get("precision", 0.0),
                    "recall": score_info.get("recall", 0.0)}
-        advisor.push(epoch, loss_dict, metrics)
-
-
-def advisor_confirm_applied(
-    advisor: Optional[TrainingAdvisor],
-    action: dict,
-) -> None:
-    """
-    Вызывать ТОЛЬКО когда совет реально применён (конфиг изменён).
-
-    Создаёт pending-запись в ExperienceDB с текущим f1_before.
-    Запись будет финализирована на следующем advisor_val_push().
-
-    Пример использования в train.py:
-
-        advices = advisor.advise()
-        for a in advices:
-            if a.level in ('critical', 'warning') and a.action:
-                logger.info('[Advisor] Применяем: %s', a.action)
-                apply_action_to_cfg(cfg, a.action)   # твоя функция
-                advisor_confirm_applied(advisor, a.action)
-                break  # применяем одно изменение за раз
-    """
-    if advisor is not None:
-        advisor.confirm_applied(action)
+        advisor.push(epoch, loss_dict, metrics=metrics, cfg=cfg)
