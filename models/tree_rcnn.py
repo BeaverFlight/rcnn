@@ -300,7 +300,11 @@ class TreeRCNN(nn.Module):
         self.anchor_gen = AnchorGenerator(cfg)
         self.stage1     = ProposalHead(cfg)
         self.stage2     = RefinementHead(cfg)
-        self.lambda_reg: float = cfg.training.lambda_reg
+        self.lambda_reg:   float = cfg.training.lambda_reg
+        # Отдельный вес для вертикальных компонент регрессии (z, h).
+        # Повышение этого значения снижает rms_v_error_m.
+        # Значение по умолчанию 1.0 сохраняет прежнее поведение.
+        self.lambda_v_reg: float = float(cfg.training.get("lambda_v_reg", 1.0))
 
         fl = cfg.training.get("focal_loss", {})
         self._focal_alpha: float = float(fl.get("alpha", 0.25) if fl else 0.25)
@@ -563,6 +567,10 @@ class TreeRCNN(nn.Module):
                [p.to(device) for p in pts_list[start:end]]
              Пиковая VRAM от pts = chunk_size * max_pts * 3 * fp16 ≈ 1.5 MB.
           4. torch.cuda.empty_cache() между чанками.
+
+        Регрессионный loss разбит на горизонтальные (x, y, w, l) и вертикальные
+        (z, h) компоненты. Вертикальные компоненты взвешиваются отдельно через
+        lambda_v_reg (cfg.training.lambda_v_reg, по умолчанию 1.0).
         """
         cfg_la = self.cfg.label_assignment
         device = points.device
@@ -618,10 +626,17 @@ class TreeRCNN(nn.Module):
             alpha=self._focal_alpha, gamma=self._focal_gamma,
         )
         pos_mask = sampled_labels == 1
-        reg_loss = (
-            smooth_l1_loss(reg_deltas[pos_mask], sampled_reg_tgt[pos_mask])
-            if pos_mask.any() else torch.tensor(0.0, device=device)
-        )
+        if pos_mask.any():
+            pred = reg_deltas[pos_mask]       # (P, 6)
+            tgt  = sampled_reg_tgt[pos_mask]  # (P, 6)
+            # x, y, w, l — стандартный вес
+            loss_xy = smooth_l1_loss(pred[:, [0, 1, 3, 4]], tgt[:, [0, 1, 3, 4]])
+            # z (индекс 2) и h (индекс 5) — повышенный вес через lambda_v_reg
+            loss_vh = smooth_l1_loss(pred[:, [2, 5]], tgt[:, [2, 5]])
+            reg_loss = loss_xy + self.lambda_v_reg * loss_vh
+        else:
+            reg_loss = torch.tensor(0.0, device=device)
+
         total = cls_loss + self.lambda_reg * reg_loss
         return {"loss_stage2_cls": cls_loss, "loss_stage2_reg": reg_loss,
                 "total_loss_stage2": total}
