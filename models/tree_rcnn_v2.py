@@ -13,8 +13,18 @@ Memory strategy (наследует от v1):
   - Stage-1: vectorised _subsample_points_batch (chunked [A_chunk x N] mask)
   - Stage-2 training: CPU offload proposals/points, chunked GPU forward,
     aux tensors (offsets, centerness, pw_xyz) накапливаются на CPU
-  - Stage-3: RelationHead запускается только на позитивных proposals (< 500)
+  - Stage-3: RelationHead запускается только на top-K proposals (< 500)
   - del промежуточных тензоров + empty_cache во всех ключевых точках
+
+Fix (Stage-3 semantic features):
+  Исходная версия передавала в RelationHead только pos_embed(coords),
+  то есть box_feats = pos_embed и внутри RelationHead суммировала
+  pos_embed + pos_embed — удвоенную геометрию без семантики.
+
+  Теперь _extract_s3_feats() прогоняет proposals через
+  stage2.extractor (SA1+SA2+global_pool) → Stage2Head.proj+fc_neck
+  и передаёт реальные семантические признаки каждого кандидата.
+  pos_embed в RelationHead остаётся как positional bias поверх feat.
 """
 from __future__ import annotations
 
@@ -37,7 +47,6 @@ from models.losses.smooth_l1 import smooth_l1_loss
 from ops.nms3d import nms3d
 from utils.box_coder import decode_boxes
 
-# Импорт вспомогательных функций из v1 (повторно использовать)
 from models.tree_rcnn import (
     _subsample_points_batch,
     _subsample_points_batch_proposals,
@@ -66,13 +75,11 @@ class TreeRCNNV2(nn.Module):
         self.stage1     = ProposalHead(cfg)
         self.stage2     = RefinementHeadV2(cfg)
 
-        # FPN: in_channels берём из cfg или дефолты
         fpn_cfg = getattr(cfg, 'fpn', None)
         fpn_in  = list(fpn_cfg.in_channels) if fpn_cfg else [256, 512, 1024]
         fpn_out = int(fpn_cfg.out_channels)  if fpn_cfg else 256
         self.fpn = TreeFPN(in_channels=fpn_in, out_channels=fpn_out)
 
-        # RelationHead: feat_dim = stage2.extractor.out_dim
         rel_cfg  = getattr(cfg, 'relation_head', None)
         rel_fdim = int(rel_cfg.feat_dim)  if rel_cfg else self.stage2.extractor.out_dim
         rel_cdim = int(rel_cfg.coord_dim) if rel_cfg else 5
@@ -82,10 +89,12 @@ class TreeRCNNV2(nn.Module):
             feat_dim=rel_fdim, coord_dim=rel_cdim,
             n_heads=rel_nh, n_layers=rel_nl,
         )
-        # Для преобразования feat_dim S2 -> feat_dim RelationHead
-        self.feat_proj = nn.Linear(
-            self.stage2.extractor.out_dim, rel_fdim
-        ) if self.stage2.extractor.out_dim != rel_fdim else nn.Identity()
+        # Проекция: Stage-2 out_dim → RelationHead feat_dim
+        s2_out = self.stage2.extractor.out_dim
+        self.feat_proj = (
+            nn.Linear(s2_out, rel_fdim)
+            if s2_out != rel_fdim else nn.Identity()
+        )
 
         self.lambda_reg:       float = cfg.training.lambda_reg
         self.lambda_v_reg:     float = float(cfg.training.get("lambda_v_reg", 1.0))
@@ -106,18 +115,15 @@ class TreeRCNNV2(nn.Module):
 
     def set_epoch(self, epoch: int) -> None:
         self._current_epoch = epoch
-
-        # Stage 2 freeze
         freeze_s2 = epoch < self._freeze_s2_epochs
         for p in self.stage2.parameters():
             p.requires_grad = not freeze_s2
-
-        # Stage 3 freeze (подключается после _freeze_s3_epochs эпох)
         freeze_s3 = epoch < self._freeze_s3_epochs
         for p in self.relation_head.parameters():
             p.requires_grad = not freeze_s3
+        for p in self.feat_proj.parameters():
+            p.requires_grad = not freeze_s3
         self._stage3_enabled = not freeze_s3
-
         if freeze_s2:
             logger.debug("Epoch %d: Stage-2 FROZEN", epoch)
         if freeze_s3:
@@ -147,7 +153,7 @@ class TreeRCNNV2(nn.Module):
         self._cuda = device.type == "cuda"
         pb = tuple(plot_bounds.tolist()) if isinstance(plot_bounds, Tensor) else plot_bounds
 
-        # ─ Stage 1 ─────────────────────────────────────────────────────────────────────
+        # ─ Stage 1 ──────────────────────────────────────────────────────────
         t1 = time.perf_counter()
         ad, al_list = self.anchor_gen.generate_all(pb, local_maxima.cpu().numpy())
         ad      = ad.to(device)
@@ -176,14 +182,13 @@ class TreeRCNNV2(nn.Module):
             return {"boxes": torch.zeros(0, 6, device=device),
                     "scores": torch.zeros(0, device=device)}
 
-        # ─ Stage 2 ─────────────────────────────────────────────────────────────────────
+        # ─ Stage 2 ──────────────────────────────────────────────────────────
         if training:
             loss_s2 = self._stage2_loss_v2(points, proposals.detach(), gt_boxes)
             loss_s3 = {"loss_stage3": torch.tensor(0.0, device=device)}
 
-            # Stage 3 включается после _freeze_s3_epochs
             if self._stage3_enabled and len(proposals) > 0:
-                loss_s3 = self._stage3_loss(proposals.detach(), gt_boxes)
+                loss_s3 = self._stage3_loss(points, proposals.detach(), gt_boxes)
 
             total = (
                 loss_s1.get("total_loss_stage1", torch.tensor(0.0, device=device))
@@ -199,12 +204,12 @@ class TreeRCNNV2(nn.Module):
 
         final_boxes, final_scores = self._stage2_inference(points, proposals)
         if len(final_boxes) > 0 and self._stage3_enabled:
-            final_scores = self._stage3_inference(final_boxes, final_scores)
+            final_scores = self._stage3_inference(points, final_boxes, final_scores)
         logger.info("  Final: %d boxes (%.2fs)", len(final_boxes), time.perf_counter() - t0)
         return {"boxes": final_boxes, "scores": final_scores}
 
     # ------------------------------------------------------------------
-    # Stage 1 (полностью идентично v1)
+    # Stage 1
     # ------------------------------------------------------------------
     def _stage1_loss_with_cache(self, points, ad, al_list, gt_boxes):
         all_anchors = torch.cat([ad] + al_list, dim=0) if al_list else ad
@@ -344,7 +349,7 @@ class TreeRCNNV2(nn.Module):
         return cls_out, reg_out
 
     # ------------------------------------------------------------------
-    # Stage 2 — training (v2 с offset + centerness)
+    # Stage 2 — training
     # ------------------------------------------------------------------
     def _stage2_loss_v2(self, points: Tensor, proposals: Tensor, gt_boxes: Tensor) -> dict:
         cfg_la = self.cfg.label_assignment
@@ -364,18 +369,16 @@ class TreeRCNNV2(nn.Module):
         sampled_reg_tgt   = reg_targets[sampled]
         S = len(sampled)
 
-        # CPU offload сэмплинг — идентично v1
         pts_list_cpu = _subsample_points_loss(
             points.cpu(), sampled_proposals.cpu(), n=_MAX_POINTS_PER_BOX
         )
 
-        # Chunked forward v2 (возвращает aux tensors)
         fwd_chunk  = self._s2_fwd_chunk
         all_cls:   list[Tensor] = []
         all_reg:   list[Tensor] = []
-        all_off:   list[Tensor] = []  # CPU
-        all_cent:  list[Tensor] = []  # CPU
-        all_xyz:   list[Tensor] = []  # CPU
+        all_off:   list[Tensor] = []
+        all_cent:  list[Tensor] = []
+        all_xyz:   list[Tensor] = []
 
         for start in range(0, S, fwd_chunk):
             end = min(start + fwd_chunk, S)
@@ -388,19 +391,18 @@ class TreeRCNNV2(nn.Module):
             all_cls.append(c.float())
             all_reg.append(r.float())
             if off is not None:
-                all_off.append(off)    # CPU
-                all_cent.append(cent)  # CPU
-                all_xyz.append(xyz)    # CPU
+                all_off.append(off)
+                all_cent.append(cent)
+                all_xyz.append(xyz)
 
             del chunk_pts
             if self._cuda:
                 torch.cuda.empty_cache()
 
-        cls_logits = torch.cat(all_cls, dim=0)  # (S, 1)
-        reg_deltas = torch.cat(all_reg, dim=0)  # (S, 6)
+        cls_logits = torch.cat(all_cls, dim=0)
+        reg_deltas = torch.cat(all_reg, dim=0)
         del all_cls, all_reg
 
-        # S1 / S2 loss (cls + reg) — идентично v1 + vertical weight
         cls_loss = sigmoid_focal_loss(
             cls_logits.squeeze(-1), sampled_labels,
             alpha=self._focal_alpha, gamma=self._focal_gamma,
@@ -417,15 +419,13 @@ class TreeRCNNV2(nn.Module):
 
         total = cls_loss + self.lambda_reg * reg_loss
 
-        # Offset + centerness loss (если aux заполнен)
         l_off = l_cent = torch.tensor(0.0, device=device)
         if all_off:
-            off_cat  = torch.cat(all_off,  dim=0).to(device)   # (S, N2, 3)
-            cent_cat = torch.cat(all_cent, dim=0).to(device)   # (S, N2, 1)
-            xyz_cat  = torch.cat(all_xyz,  dim=0).to(device)   # (S, N2, 3)
+            off_cat  = torch.cat(all_off,  dim=0).to(device)
+            cent_cat = torch.cat(all_cent, dim=0).to(device)
+            xyz_cat  = torch.cat(all_xyz,  dim=0).to(device)
             del all_off, all_cent, all_xyz
 
-            # Для loss нужны только позитивные proposals
             if pos_mask.any():
                 loss_dict = stage2_loss_v2(
                     cls_score=cls_logits,
@@ -436,7 +436,7 @@ class TreeRCNNV2(nn.Module):
                     gt_box=sampled_reg_tgt,
                     gt_label=sampled_labels,
                     lambdas={
-                        'cls': 0.0,     # уже считали выше
+                        'cls': 0.0,
                         'reg': 0.0,
                         'offset': float(getattr(self.cfg.training, 'lambda_offset', 0.5)),
                         'centerness': float(getattr(self.cfg.training, 'lambda_centerness', 0.5)),
@@ -487,43 +487,147 @@ class TreeRCNNV2(nn.Module):
         return refined[keep], scores[keep]
 
     # ------------------------------------------------------------------
+    # Stage 3 helpers — извлечение семантических признаков
+    # ------------------------------------------------------------------
+    def _extract_s3_feats(
+        self, points: Tensor, proposals: Tensor, grad: bool
+    ) -> Tensor:
+        """
+        Прогоняет proposals через Stage-2 extractor и возвращает
+        семантические признаки каждого кандидата.
+
+        Маршрут:
+            points → SA1+SA2 (point-wise) → stage2_head.proj + fc_neck
+            → (N, rel_feat_dim)
+
+        Аргументы
+        ---------
+        points    : (M, 3) облако точек всего плота
+        proposals : (N, 6) боксы кандидатов
+        grad      : True во время обучения (нужен gradient через feat_proj),
+                    False при инференсе
+
+        Возвращает
+        ----------
+        box_feats : (1, N, rel_feat_dim) — семантические признаки, готовые
+                    для подачи в RelationHead.forward() как первый аргумент
+        """
+        device = points.device
+        N = len(proposals)
+
+        # Сэмплируем точки для каждого proposal (CPU, затем на GPU чанком)
+        pts_list_cpu = _subsample_points_loss(
+            points.cpu(), proposals.cpu(), n=_MAX_POINTS_PER_BOX
+        )
+
+        chunk   = self._s2_fwd_chunk
+        feat_dim = self.stage2.extractor.out_dim
+        feats_buf = torch.zeros(N, feat_dim, device=device)
+
+        ctx = torch.enable_grad() if grad else torch.inference_mode()
+        with ctx:
+            for start in range(0, N, chunk):
+                end        = min(start + chunk, N)
+                chunk_pts  = [p.to(device, non_blocking=True) for p in pts_list_cpu[start:end]]
+                chunk_prop = proposals[start:end]
+
+                # SA1+SA2 point-wise признаки
+                with torch.autocast(device_type=self._amp_device_type, enabled=grad):
+                    pw_feats, pw_xyz = self.stage2._extract_pw_features(
+                        self._pad_pts(chunk_pts, device), chunk_prop
+                    )  # (B_c, S2, C2)
+
+                    # Взвешенный глобальный пулинг (повторяем Stage2Head.forward)
+                    head  = self.stage2.stage2_head
+                    cent  = head.centerness_head(pw_feats)              # (B_c, S2, 1)
+                    w_att = cent / (cent.sum(dim=1, keepdim=True) + 1e-6)
+                    concat = torch.cat([pw_xyz + head.offset_head(pw_feats),
+                                        pw_feats], dim=-1)              # (B_c, S2, 3+C2)
+                    g_feat = (concat * w_att).sum(dim=1)                # (B_c, 3+C2)
+                    x = head._fc_neck(head.proj(g_feat))               # (B_c, feat_dim)
+
+                feats_buf[start:end] = x.detach().float() if not grad else x.float()
+
+                del chunk_pts, pw_feats, pw_xyz, cent, w_att, concat, g_feat, x
+                if self._cuda:
+                    torch.cuda.empty_cache()
+
+        # Применяем проекцию в rel_feat_dim (с градиентом если grad=True)
+        proj_ctx = torch.enable_grad() if grad else torch.inference_mode()
+        with proj_ctx:
+            box_feats = self.feat_proj(feats_buf)   # (N, rel_feat_dim)
+
+        return box_feats.unsqueeze(0)  # (1, N, rel_feat_dim)
+
+    @staticmethod
+    def _pad_pts(pts_list: list[Tensor], device: torch.device) -> Tensor:
+        """Padding списка point-тензоров в батч (B, max_N, 3)."""
+        max_n = max(p.shape[0] for p in pts_list)
+        B     = len(pts_list)
+        out   = torch.zeros(B, max_n, 3, device=device)
+        for k, pts in enumerate(pts_list):
+            n = pts.shape[0]
+            if n < max_n:
+                pts = pts.repeat((max_n + n - 1) // n, 1)[:max_n]
+            out[k] = pts
+        return out
+
+    # ------------------------------------------------------------------
     # Stage 3 — training
     # ------------------------------------------------------------------
-    def _stage3_loss(self, proposals: Tensor, gt_boxes: Tensor) -> dict:
+    def _stage3_loss(
+        self, points: Tensor, proposals: Tensor, gt_boxes: Tensor
+    ) -> dict:
         """
         Вычисляет loss для RelationHead.
-        GT: IoU > 0.5 с каким-либо GT-боксом.
-        Работает на top-K proposals (макс 500) для контроля O(N^2) памяти.
+
+        FIX: box_feats — реальные семантические признаки из Stage-2 extractor,
+        а не просто pos_embed(coords). pos_embed используется внутри
+        RelationHead как positional bias: x = drop(box_feats + pos_embed(coords)).
+
+        Граф:
+            points + proposals
+                ↓  _extract_s3_feats (grad=True через feat_proj)
+            box_feats (1, N, rel_feat_dim)   ←── семантика
+            box_coords (1, N, 5)             ←── геометрия
+                ↓  RelationHead.forward()
+            scores (1, N, 1)
+                ↓  relation_loss
+            loss_stage3
         """
         from models.losses import relation_loss
-        from ops.iou3d import iou3d_batch  # ожидаем функцию iou3d_batch
+        from ops.iou3d import iou3d_batch
 
-        device = proposals.device
-        MAX_S3 = int(getattr(self.cfg.training, 'stage3_max_proposals', 500))
+        device  = proposals.device
+        MAX_S3  = int(getattr(self.cfg.training, 'stage3_max_proposals', 500))
 
-        # Ограничиваем число кандидатов
         if len(proposals) > MAX_S3:
             proposals = proposals[:MAX_S3]
         N = len(proposals)
 
-        # IoU proposals с GT
+        # GT labels по IoU
         with torch.no_grad():
-            iou = iou3d_batch(proposals, gt_boxes)   # (N, M)
-            gt_labels = (iou.max(dim=1).values >= 0.5).float()  # (N,)
+            iou       = iou3d_batch(proposals, gt_boxes)              # (N, M)
+            gt_labels = (iou.max(dim=1).values >= 0.5).float()       # (N,)
+        del iou
 
-        # Признаки из Stage 2 (cls_score как прокси box_feats)
-        # Используем простую проекцию предложения (cx,cy,cz,w,h) в feat_dim
-        coords = proposals[:, [0, 1, 2, 3, 5]].unsqueeze(0)     # (1, N, 5)
-        # Проекция координат в feat space через pos_embed в RelationHead
-        box_feats = self.relation_head.pos_embed(coords)          # (1, N, feat_dim)
-        scores    = self.relation_head(box_feats, coords)         # (1, N, 1)
+        # Координаты для positional encoding
+        coords = proposals[:, [0, 1, 2, 3, 5]].unsqueeze(0)          # (1, N, 5)
+
+        # Семантические признаки из Stage 2 (с градиентом через feat_proj)
+        box_feats = self._extract_s3_feats(points, proposals, grad=True)  # (1, N, rel_fdim)
+
+        # RelationHead: box_feats + pos_embed(coords) через Transformer
+        with torch.autocast(device_type=self._amp_device_type):
+            scores = self.relation_head(box_feats, coords)            # (1, N, 1)
 
         loss = relation_loss(
             pred_scores=scores,
-            gt_labels=gt_labels.unsqueeze(0),  # (1, N)
+            gt_labels=gt_labels.unsqueeze(0),
             lambda_rel=self.lambda_stage3,
         )
-        del box_feats, scores, iou, coords
+
+        del box_feats, scores, gt_labels, coords
         if self._cuda:
             torch.cuda.empty_cache()
 
@@ -532,18 +636,25 @@ class TreeRCNNV2(nn.Module):
     # ------------------------------------------------------------------
     # Stage 3 — inference
     # ------------------------------------------------------------------
-    def _stage3_inference(self, boxes: Tensor, scores: Tensor) -> Tensor:
+    def _stage3_inference(
+        self, points: Tensor, boxes: Tensor, scores: Tensor
+    ) -> Tensor:
         """
-        Пересчитывает scores с учётом контекста соседей.
-        Возвращает обновлённые scores (те же боксы, но лучше отфильтрованы).
+        Пересчитывает scores с учётом семантики и контекста соседей.
+        Теперь также использует реальные Stage-2 признаки.
         """
         device = boxes.device
-        coords = boxes[:, [0, 1, 2, 3, 5]].unsqueeze(0)   # (1, N, 5)
+        coords = boxes[:, [0, 1, 2, 3, 5]].unsqueeze(0)              # (1, N, 5)
+
+        # Признаки без градиента (инференс)
+        box_feats = self._extract_s3_feats(points, boxes, grad=False) # (1, N, rel_fdim)
+
         with torch.inference_mode():
-            feats  = self.relation_head.pos_embed(coords)  # (1, N, feat_dim)
-            new_sc = self.relation_head(feats, coords)     # (1, N, 1)
-        new_scores = new_sc.squeeze(0).squeeze(-1)         # (N,)
-        del feats, new_sc, coords
+            with torch.autocast(device_type=self._amp_device_type):
+                new_sc = self.relation_head(box_feats, coords)        # (1, N, 1)
+        new_scores = new_sc.squeeze(0).squeeze(-1)                    # (N,)
+
+        del box_feats, new_sc, coords
         if self._cuda:
             torch.cuda.empty_cache()
         return new_scores
