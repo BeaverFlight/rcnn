@@ -14,6 +14,14 @@ Checkpoint policy:
 Memory:
   AMP (autocast + GradScaler) on CUDA.
   torch.cuda.empty_cache() after backward+step.
+
+Advisor:
+  TrainingAdvisor (+ ConfigWatcher) подключён в train_fold().
+  Каждую эпоху push() передаёт cfg → ConfigWatcher видит изменения
+  и автоматически создаёт pending-записи в ExperienceDB.
+  После каждой валидации advisor_val_push() финализирует delta_f1.
+  В конце фолда advisor.finalize() печатает итоговый отчёт.
+  Отключить: --no_advisor (или advisor: false в конфиге).
 """
 from __future__ import annotations
 
@@ -23,6 +31,7 @@ import random
 import shutil
 import time
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import torch
@@ -38,6 +47,13 @@ from utils.metrics import (
     newfor_matching,
     compute_global_metrics,
 )
+
+# Advisor — опциональная зависимость: если пакет не установлен, молча пропускаем
+try:
+    from advisor.integration import make_advisor, advisor_push, advisor_val_push
+    _ADVISOR_AVAILABLE = True
+except ImportError:
+    _ADVISOR_AVAILABLE = False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -197,7 +213,8 @@ def _evaluate_fold(model, val_ds, cfg, device) -> list[PlotMetrics]:
 # Training loop
 # ---------------------------------------------------------------------------
 
-def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
+def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device,
+               use_advisor: bool = True):
     assert cfg.training.batch_size == 1, "batch_size > 1 is not supported."
     logger.info("=== Fold %d | Train: %s | Val: %s | Model: %s ===",
                 fold_idx, train_ids, val_ids,
@@ -255,14 +272,30 @@ def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
     log_interval   = int(cfg.training.get("log_interval",    3))
     max_grad_norm  = float(cfg.training.get("max_grad_norm", 1.0))
     ckpt_interval  = int(cfg.training.get("checkpoint_interval", 10))
+    advisor_interval = int(cfg.training.get("advisor_interval", 0))  # 0 = выводить только при val
     is_cuda        = device.type == "cuda"
     cfg_dict       = OmegaConf.to_container(cfg, resolve=True)
+
+    # ── Advisor ──────────────────────────────────────────────────────────
+    advisor = None
+    if use_advisor and _ADVISOR_AVAILABLE:
+        try:
+            advisor = make_advisor(
+                cfg=cfg,
+                data_root=data_root,
+                report_interval=advisor_interval,
+            )
+            logger.info("[Advisor] Инициализирован (ConfigWatcher активен).")
+        except Exception as exc:
+            logger.warning("[Advisor] Ошибка инициализации, продолжаем без него: %s", exc)
+    # ─────────────────────────────────────────────────────────────────────
 
     for epoch in range(start_epoch, cfg.training.epochs):
         model.set_epoch(epoch)
         model.train()
 
         epoch_losses: list[float] = []
+        loss_dict_last: dict = {}
         nan_batches = 0
 
         for batch_idx, batch in enumerate(train_loader):
@@ -289,10 +322,10 @@ def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
 
             loss_dict  = model(points, gt_boxes, local_maxima, plot_bounds, training=True)
             total_loss = loss_dict["total_loss"]
+            loss_dict_last = loss_dict  # сохраняем для advisor
 
             _log_vram(f"e{epoch+1}/b{batch_idx+1} post")
 
-            # Логируем компоненты loss: v1 и v2 имеют разный набор ключей
             if (batch_idx + 1) % log_interval == 0:
                 loss_parts = {
                     k: f"{v.item():.4f}" if isinstance(v, torch.Tensor) else f"{v:.4f}"
@@ -329,6 +362,17 @@ def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
                     epoch+1, cfg.training.epochs, mean_loss, nan_batches,
                     optimizer.param_groups[0]["lr"])
 
+        # ── Advisor: push каждую эпоху (без метрик — только loss + cfg snapshot) ──
+        # loss_dict_last конвертируем в scalar-dict для advisor
+        _loss_scalar = {
+            k: float(v.item()) if isinstance(v, torch.Tensor) else float(v)
+            for k, v in loss_dict_last.items()
+            if k != "total_loss"
+        }
+        _loss_scalar["total_loss"] = mean_loss
+        advisor_push(advisor, epoch + 1, _loss_scalar, cfg=cfg)
+        # ─────────────────────────────────────────────────────────────────
+
         if (epoch + 1) % ckpt_interval == 0:
             save_checkpoint(model, optimizer, epoch+1, best_score,
                             ckpt_dir / "latest.pth", cfg=cfg, scaler=scaler)
@@ -357,6 +401,10 @@ def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
                 info["total_detected"], info["total_reference"], info["total_matched"],
             )
 
+            # ── Advisor: val push — финализирует delta_f1 для pending записей ──
+            advisor_val_push(advisor, epoch + 1, _loss_scalar, info, cfg=cfg)
+            # ─────────────────────────────────────────────────────────────────
+
             if score > best_score:
                 best_score = score
                 shutil.copy2(epoch_ckpt, ckpt_dir / "best.pth")
@@ -364,6 +412,14 @@ def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
                 logger.info("★ New best! F1=%.4f", best_score)
 
             model.train()
+
+    # ── Advisor: итоговый отчёт по фолду ─────────────────────────────────
+    if advisor is not None:
+        try:
+            advisor.finalize()
+        except Exception as exc:
+            logger.warning("[Advisor] finalize failed: %s", exc)
+    # ─────────────────────────────────────────────────────────────────────
 
 
 # ---------------------------------------------------------------------------
@@ -373,11 +429,13 @@ def train_fold(fold_idx, train_ids, val_ids, data_root, cfg, out_dir, device):
 def main() -> None:
     import argparse
     parser = argparse.ArgumentParser(description="Train TreeRCNN (v1/v2)")
-    parser.add_argument("--config",    default="configs/tree_rcnn.yaml")
-    parser.add_argument("--data_root", required=True)
-    parser.add_argument("--out_dir",   default="outputs/")
-    parser.add_argument("--fold",      type=int, default=None,
+    parser.add_argument("--config",      default="configs/tree_rcnn.yaml")
+    parser.add_argument("--data_root",   required=True)
+    parser.add_argument("--out_dir",     default="outputs/")
+    parser.add_argument("--fold",        type=int, default=None,
                         help="Конкретный номер фолда (0-3). None = все фолды.")
+    parser.add_argument("--no_advisor",  action="store_true",
+                        help="Отключить TrainingAdvisor.")
     args = parser.parse_args()
 
     cfg = OmegaConf.load(args.config)
@@ -393,6 +451,16 @@ def main() -> None:
     out_dir   = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    use_advisor = (
+        not args.no_advisor
+        and _ADVISOR_AVAILABLE
+        and bool(cfg.get("advisor", {}).get("enabled", True))
+    )
+    if not _ADVISOR_AVAILABLE:
+        logger.info("Advisor недоступен (advisor/ не найден).")
+    elif not use_advisor:
+        logger.info("Advisor отключён через --no_advisor или конфиг.")
+
     folds: list[list[int]] = [list(f) for f in cfg.cross_validation.folds]
     all_ids = [pid for fold in folds for pid in fold]
 
@@ -400,7 +468,8 @@ def main() -> None:
     for fi in fold_range:
         val_ids   = folds[fi]
         train_ids = [pid for pid in all_ids if pid not in val_ids]
-        train_fold(fi, train_ids, val_ids, data_root, cfg, out_dir, device)
+        train_fold(fi, train_ids, val_ids, data_root, cfg, out_dir, device,
+                   use_advisor=use_advisor)
 
 
 if __name__ == "__main__":
