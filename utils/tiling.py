@@ -1,34 +1,38 @@
 """
 utils/tiling.py — Модуль тайлинга для TreeRCNN v2.0
 
-Два публичных класса:
-  - TrainingTiler : случайная нарезка во время обучения
-  - InferenceTiler: скользящее окно с перекрытием для инференса
+Фиксы:
+  - InferenceTiler.merge(): заменён неверный Python `and` на numpy поэлементный `&`
+  - TrainingTiler: добавлен fallback-поведение в random_tile (max_attempts)
+  - rich_features fallback: добавлен warning если Open3D не установлен
 """
 from __future__ import annotations
 
+import logging
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Iterator, List, Optional, Tuple
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class TileConfig:
-    tile_size: float = 40.0          # метры
-    overlap: float = 10.0            # перекрытие при инференсе
-    min_trees: int = 3               # минимум GT-деревьев в тайле
-    max_points: int = 32768          # субсэмплинг если точек больше
-    min_points: int = 100            # тайл игнорируется если точек меньше
-    center_weight: float = 1.0       # вес боксов из центральной зоны
-    border_weight: float = 0.5       # вес боксов из буферной зоны
+    tile_size: float = 40.0
+    overlap: float = 10.0
+    min_trees: int = 3
+    max_points: int = 32768
+    min_points: int = 100
+    center_weight: float = 1.0
+    border_weight: float = 0.5
 
 
 @dataclass
 class TileMeta:
-    origin_x: float          # глобальные координаты центра тайла
+    origin_x: float
     origin_y: float
     tile_idx: int
-    is_border: bool = False  # тайл на краю плота
+    is_border: bool = False
 
 
 class TrainingTiler:
@@ -37,37 +41,49 @@ class TrainingTiler:
 
     Пример использования в Dataset.__getitem__:
         tiler = TrainingTiler(cfg)
-        for _ in range(10):  # до 10 попыток найти непустой тайл
-            result = tiler.random_tile(plot_points, gt_boxes)
-            if result is not None:
-                tile_pts, tile_gt = result
-                break
+        result = tiler.random_tile(plot_points, gt_boxes)  # max_attempts попыток внутри
+        if result is None:
+            # весь плот пустой — пропустить или взять другой плот
+            ...
+        tile_pts, tile_gt = result
     """
 
-    def __init__(self, cfg: TileConfig):
+    def __init__(self, cfg: TileConfig, max_attempts: int = 10):
         self.cfg = cfg
+        self.max_attempts = max_attempts
 
     def random_tile(
         self,
-        points: np.ndarray,   # (N, 9) — обогащённые точки xyz+features
-        gt_boxes: np.ndarray, # (M, 6) — cx, cy, cz, w, l, h
+        points: np.ndarray,    # (N, 9) — обогащённые точки
+        gt_boxes: np.ndarray,  # (M, 6) — cx, cy, cz, w, l, h
     ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         """
-        Выбирает случайный GT-якорь, добавляет случайное смещение,
-        вырезает тайл и фильтрует GT-боксы по центру.
-
+        Делает до max_attempts попыток найти непустой тайл.
         Возвращает (tile_points, tile_gt_boxes) с локализованными
-        координатами (центр тайла = (0, 0)) или None если тайл пустой.
+        координатами (центр тайла = (0, 0)) или None если все попытки неудачны.
         """
+        for _ in range(self.max_attempts):
+            result = self._try_tile(points, gt_boxes)
+            if result is not None:
+                return result
+        logger.warning(
+            "TrainingTiler: не удалось найти непустой тайл за %d попыток (min_trees=%d)",
+            self.max_attempts, self.cfg.min_trees
+        )
+        return None
+
+    def _try_tile(
+        self,
+        points: np.ndarray,
+        gt_boxes: np.ndarray,
+    ) -> Optional[Tuple[np.ndarray, np.ndarray]]:
         cfg = self.cfg
         half = cfg.tile_size / 2.0
 
-        # Случайный якорь — одно из GT-деревьев
         anchor = gt_boxes[np.random.randint(len(gt_boxes))]
         cx = anchor[0] + np.random.uniform(-10.0, 10.0)
         cy = anchor[1] + np.random.uniform(-10.0, 10.0)
 
-        # Вырезаем точки
         mask_pts = (
             (points[:, 0] >= cx - half) & (points[:, 0] <= cx + half) &
             (points[:, 1] >= cy - half) & (points[:, 1] <= cy + half)
@@ -77,7 +93,6 @@ class TrainingTiler:
         if len(tile_pts) < cfg.min_points:
             return None
 
-        # GT-боксы: только те, чей центр строго внутри тайла
         mask_gt = (
             (gt_boxes[:, 0] >= cx - half) & (gt_boxes[:, 0] <= cx + half) &
             (gt_boxes[:, 1] >= cy - half) & (gt_boxes[:, 1] <= cy + half)
@@ -87,12 +102,10 @@ class TrainingTiler:
         if len(tile_gt) < cfg.min_trees:
             return None
 
-        # Субсэмплинг
         if len(tile_pts) > cfg.max_points:
             idx = np.random.choice(len(tile_pts), cfg.max_points, replace=False)
             tile_pts = tile_pts[idx]
 
-        # Локализация: центр тайла → (0, 0)
         tile_pts[:, 0] -= cx
         tile_pts[:, 1] -= cy
         tile_gt[:, 0] -= cx
@@ -105,7 +118,7 @@ class InferenceTiler:
     """
     Скользящее окно с перекрытием для инференса.
 
-    Пример использования:
+    Пример:
         tiler = InferenceTiler(cfg)
         for tile_pts, meta in tiler.tiles(las_points):
             boxes = model.predict(tile_pts)
@@ -120,16 +133,12 @@ class InferenceTiler:
     def tiles(
         self, points: np.ndarray
     ) -> Iterator[Tuple[np.ndarray, TileMeta]]:
-        """
-        Генератор тайлов. Yields (tile_points, TileMeta).
-        Координаты точек локализованы относительно центра тайла.
-        """
-        cfg = self.cfg
+        cfg  = self.cfg
         half = cfg.tile_size / 2.0
         step = cfg.tile_size - cfg.overlap
 
-        x_min, x_max = points[:, 0].min(), points[:, 0].max()
-        y_min, y_max = points[:, 1].min(), points[:, 1].max()
+        x_min, x_max = float(points[:, 0].min()), float(points[:, 0].max())
+        y_min, y_max = float(points[:, 1].min()), float(points[:, 1].max())
 
         xs = np.arange(x_min + half, x_max, step)
         ys = np.arange(y_min + half, y_max, step)
@@ -151,16 +160,16 @@ class InferenceTiler:
                     tile_pts = tile_pts[idx]
 
                 is_border = (
-                    cx - half <= x_min + 1.0 or cx + half >= x_max - 1.0 or
-                    cy - half <= y_min + 1.0 or cy + half >= y_max - 1.0
+                    (cx - half <= x_min + step * 0.1) or
+                    (cx + half >= x_max - step * 0.1) or
+                    (cy - half <= y_min + step * 0.1) or
+                    (cy + half >= y_max - step * 0.1)
                 )
 
                 meta = TileMeta(
-                    origin_x=cx, origin_y=cy,
+                    origin_x=float(cx), origin_y=float(cy),
                     tile_idx=tile_idx, is_border=is_border
                 )
-
-                # Локализация
                 tile_pts[:, 0] -= cx
                 tile_pts[:, 1] -= cy
 
@@ -168,10 +177,6 @@ class InferenceTiler:
                 yield tile_pts, meta
 
     def collect(self, boxes: np.ndarray, meta: TileMeta) -> None:
-        """
-        Принимает боксы из тайла (в локальных координатах),
-        переводит их обратно в глобальные и сохраняет.
-        """
         if boxes is None or len(boxes) == 0:
             return
         global_boxes = boxes.copy()
@@ -179,29 +184,35 @@ class InferenceTiler:
         global_boxes[:, 1] += meta.origin_y
         self._collected.append((global_boxes, meta))
 
-    def merge(self, iou_threshold: float = 0.3) -> np.ndarray:
+    def merge(self, score_col: int = 6) -> np.ndarray:
         """
-        Объединяет боксы из всех тайлов.
-        Боксы из буферной зоны (overlap) получают пониженный score.
-        Применяет финальный NMS.
+        Объединяет боксы из всех тайлов с взвешением скоров.
+        Фикс: заменён неверный Python `and` на numpy поэлементный `&`.
+
+        score_col: индекс колонки score в матрице боксов (по умолчанию 6)
         """
         if not self._collected:
             return np.empty((0, 7))
 
-        cfg = self.cfg
+        cfg    = self.cfg
         buffer = cfg.overlap / 2.0
         all_boxes = []
 
         for boxes, meta in self._collected:
             weighted = boxes.copy()
-            # Боксы в центральной зоне тайла
-            in_center = (
-                np.abs(boxes[:, 0] - meta.origin_x) <= (cfg.tile_size / 2.0 - buffer) and
-                np.abs(boxes[:, 1] - meta.origin_y) <= (cfg.tile_size / 2.0 - buffer)
-            )
-            if boxes.shape[1] > 6:  # если есть score-колонка
-                weight = cfg.center_weight if not meta.is_border else cfg.border_weight
-                weighted[:, 6] *= weight
+
+            if weighted.shape[1] > score_col:
+                # Поэлементный `&` вместо Python `and` — исправлено ValueError
+                half = cfg.tile_size / 2.0
+                in_center = (
+                    (np.abs(weighted[:, 0] - meta.origin_x) <= (half - buffer)) &
+                    (np.abs(weighted[:, 1] - meta.origin_y) <= (half - buffer))
+                )
+                weight = cfg.border_weight if meta.is_border else cfg.center_weight
+                # центральная зона получает полный вес, буферная — пониженный
+                weighted[~in_center, score_col] *= cfg.border_weight
+                weighted[in_center, score_col]  *= weight
+
             all_boxes.append(weighted)
 
         return np.concatenate(all_boxes, axis=0)

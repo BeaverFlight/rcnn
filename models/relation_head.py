@@ -1,11 +1,7 @@
 """
 models/relation_head.py — Stage 3: Relation Head (Transformer) для TreeRCNN v2.0
 
-Принимает N кандидатов-деревьев из Stage 2,
-пропускает их через Self-Attention (каждое дерево «смотрит» на соседей),
-выдаёт финальные scores с учётом контекста.
-
-Это заменяет жёсткий NMS на обучаемую фильтрацию дубликатов.
+Фикс: убран enable_nested_tensor=False (устарел в PyTorch >= 2.1)
 """
 from __future__ import annotations
 
@@ -15,18 +11,22 @@ import torch.nn as nn
 
 class RelationHead(nn.Module):
     """
+    Принимает N кандидатов-деревьев из Stage 2,
+    пропускает через Self-Attention (каждое дерево «смотрит» на соседей),
+    выдаёт финальные scores с учётом контекста соседей.
+
     Args:
-        feat_dim  : размерность признаков кандидата (выход Stage 2)
-        coord_dim : размерность координат бокса (по умолчанию 5: cx,cy,cz,w,h)
-        n_heads   : число голов внимания
+        feat_dim  : размерность признаков кандидата
+        coord_dim : размерность координат бокса (5: cx,cy,cz,w,h)
+        n_heads   : число голов внимания (feat_dim должен делиться на n_heads)
         n_layers  : число TransformerEncoder слоёв
 
     Forward:
-        box_feats  : (B, N, feat_dim) — признаки N кандидатов
-        box_coords : (B, N, coord_dim)— координаты боксов (cx,cy,cz,w,h)
+        box_feats  : (B, N, feat_dim)  — признаки N кандидатов
+        box_coords : (B, N, coord_dim) — координаты боксов (cx,cy,cz,w,h)
 
     Returns:
-        scores : (B, N, 1) — финальные scores с учётом контекста соседей
+        scores : (B, N, 1) — финальные scores, sigmoid [0..1]
     """
 
     def __init__(
@@ -37,6 +37,8 @@ class RelationHead(nn.Module):
         n_layers: int = 2,
     ):
         super().__init__()
+        assert feat_dim % n_heads == 0, \
+            f"feat_dim ({feat_dim}) must be divisible by n_heads ({n_heads})"
 
         # Позиционное кодирование: координаты бокса → feat_dim
         self.pos_embed = nn.Sequential(
@@ -47,6 +49,8 @@ class RelationHead(nn.Module):
         )
 
         # Self-attention Transformer Encoder
+        # Фикс: убран enable_nested_tensor=False (устарел в PyTorch >= 2.1,
+        # вызывал TypeError на новых версиях)
         encoder_layer = nn.TransformerEncoderLayer(
             d_model=feat_dim,
             nhead=n_heads,
@@ -59,7 +63,6 @@ class RelationHead(nn.Module):
         self.transformer = nn.TransformerEncoder(
             encoder_layer,
             num_layers=n_layers,
-            enable_nested_tensor=False,
         )
 
         # Финальный пересчёт score с учётом контекста
@@ -69,8 +72,6 @@ class RelationHead(nn.Module):
             nn.Linear(256, 1),
             nn.Sigmoid(),
         )
-
-        # Dropout на входе
         self.input_drop = nn.Dropout(0.1)
 
     def forward(
@@ -78,16 +79,7 @@ class RelationHead(nn.Module):
         box_feats: torch.Tensor,   # (B, N, feat_dim)
         box_coords: torch.Tensor,  # (B, N, coord_dim)
     ) -> torch.Tensor:             # (B, N, 1)
-
-        # Позиционная информация о соседях
-        pos = self.pos_embed(box_coords)  # (B, N, feat_dim)
-
-        # Признаки + позиционное кодирование
-        x = self.input_drop(box_feats + pos)  # (B, N, feat_dim)
-
-        # Каждое дерево «смотрит» на все остальные
-        x = self.transformer(x)  # (B, N, feat_dim)
-
-        # Финальные scores
-        scores = self.final_cls(x)  # (B, N, 1)
-        return scores
+        pos = self.pos_embed(box_coords)         # (B, N, feat_dim)
+        x   = self.input_drop(box_feats + pos)   # (B, N, feat_dim)
+        x   = self.transformer(x)                # (B, N, feat_dim)
+        return self.final_cls(x)                 # (B, N, 1)
