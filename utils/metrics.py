@@ -15,7 +15,7 @@ from torch import Tensor
 
 logger = logging.getLogger(__name__)
 
-SEARCH_RADIUS = 3.0  # meters (NEWFOR default)
+SEARCH_RADIUS = 2.23  # meters (NEWFOR default)
 
 
 @dataclass
