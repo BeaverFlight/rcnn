@@ -1,19 +1,19 @@
 """
 Stage 1: Proposal Generation Network.
 
-Changed:
-  - reg_head outputs 6D deltas (tx, ty, tz, tw, tl, th).
-  - forward() accepts batch (B, N, 3) and returns (cls: B×1, reg: B×6).
-  - extract_features использует gradient checkpointing для каждого SA-слоя:
-    сохраняются только входы/выходы слоёв, промежуточные активации
-    пересчитываются при backward. Снижает пик VRAM backward на ~60%.
-    Checkpointing включён только в режиме training (requires_grad=True),
-    при inference (torch.inference_mode / no_grad) — пропускается автоматически.
+Изменения:
+  - reg_head выдаёт 6D дельты (tx, ty, tz, tw, tl, th).
+  - forward() принимает опциональный fpn_context: (B, fpn_dim)
+    из TreeFPN p2-уровня. Если передан, конкатенируется с SA3-признаком
+    через fpn_proj перед cls/reg-головами.
+  - Обратная совместимость: fpn_context=None — поведение v1 сохранено.
+  - Gradient checkpointing для каждого SA-слоя снижает пик VRAM backward ~60%%.
 """
 
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -29,6 +29,9 @@ class ProposalHead(nn.Module):
     """
     Stage-1 head: processes a batch of windows with PointNet++,
     predicts objectness score and 6D box delta per anchor.
+
+    Опционально принимает FPN-контекст (fpn_context) из TreeFPN,
+    который конкатенируется с SA3-глобальным признаком.
     """
 
     def __init__(self, cfg) -> None:
@@ -62,81 +65,101 @@ class ProposalHead(nn.Module):
         )
 
         feat_dim = sa2_mlp[-1]
+
+        # FPN интеграция: проекция FPN-контекста в feat_dim
+        # fpn_dim читается из cfg.fpn.out_channels;
+        # если 0 или отсутствует — FPN не используется (v1-совместимость)
+        fpn_cfg = getattr(cfg, 'fpn', None)
+        fpn_dim = int(fpn_cfg.out_channels) if fpn_cfg else 0
+        if fpn_dim > 0:
+            self.fpn_proj = nn.Sequential(
+                nn.Linear(fpn_dim, feat_dim),
+                nn.LayerNorm(feat_dim),
+                nn.GELU(),
+            )
+            # Объединяющий проекцирует [sa3_feat || fpn_feat] → feat_dim
+            self.fusion = nn.Linear(feat_dim * 2, feat_dim)
+        else:
+            self.fpn_proj = None
+            self.fusion   = None
+
         self.cls_head = nn.Linear(feat_dim, 1)   # objectness logit
         self.reg_head = nn.Linear(feat_dim, 6)   # 6D: (tx, ty, tz, tw, tl, th)
 
     # ------------------------------------------------------------------
-    # Статические обёртки для checkpoint — нужны чтобы передавать
-    # Optional[Tensor] через *args интерфейс checkpoint.checkpoint.
-    # checkpoint требует Tensor-аргументы; None передаём как sentinel.
+    # Статические обёртки для gradient checkpoint
     # ------------------------------------------------------------------
 
     @staticmethod
-    def _sa1_fn(sa1: PointNetSetAbstraction, xyz: Tensor) -> tuple[Tensor, Tensor]:
-        new_xyz, feats = sa1(xyz, None)
-        return new_xyz, feats
+    def _sa1_fn(
+        sa1: PointNetSetAbstraction, xyz: Tensor
+    ) -> tuple[Tensor, Tensor]:
+        return sa1(xyz, None)
 
     @staticmethod
     def _sa2_fn(
         sa2: PointNetSetAbstraction, xyz: Tensor, feats: Tensor
     ) -> tuple[Tensor, Tensor]:
-        new_xyz, new_feats = sa2(xyz, feats)
-        return new_xyz, new_feats
+        return sa2(xyz, feats)
 
     @staticmethod
     def _sa3_fn(
         sa3: PointNetSetAbstraction, xyz: Tensor, feats: Tensor
     ) -> Tensor:
         _, out = sa3(xyz, feats)
-        return out  # (B, 1, D)
+        return out   # (B, 1, D)
 
     def extract_features(self, xyz: Tensor) -> Tensor:
         """
-        Run PointNet++ on a batch of windows.
+        Запускает PointNet++ на батче виндоу.
 
         Args:
             xyz: (B, N, 3)
 
         Returns:
             feat: (B, feat_dim)
-
-        Gradient checkpointing включён когда любой параметр требует grad
-        (т.е. в training-pass с infer_mode=False). При inference_mode /
-        no_grad — use_reentrant=False делает checkpoint прозрачным,
-        фактически выполняя forward без сохранения сегментов.
         """
-        training_pass = torch.is_grad_enabled() and xyz.requires_grad or any(
+        training_pass = torch.is_grad_enabled() and any(
             p.requires_grad for p in self.sa1.parameters()
         )
 
         if training_pass:
             xyz1, f1 = ckpt.checkpoint(
-                self._sa1_fn, self.sa1, xyz,
-                use_reentrant=False,
+                self._sa1_fn, self.sa1, xyz, use_reentrant=False,
             )
             xyz2, f2 = ckpt.checkpoint(
-                self._sa2_fn, self.sa2, xyz1, f1,
-                use_reentrant=False,
+                self._sa2_fn, self.sa2, xyz1, f1, use_reentrant=False,
             )
             f3 = ckpt.checkpoint(
-                self._sa3_fn, self.sa3, xyz2, f2,
-                use_reentrant=False,
+                self._sa3_fn, self.sa3, xyz2, f2, use_reentrant=False,
             )
         else:
             xyz1, f1 = self.sa1(xyz, None)
             xyz2, f2 = self.sa2(xyz1, f1)
-            _, f3   = self.sa3(xyz2, f2)
+            _, f3    = self.sa3(xyz2, f2)
 
         return f3.squeeze(1)   # (B, feat_dim)
 
-    def forward(self, xyz: Tensor) -> tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        xyz: Tensor,
+        fpn_context: Optional[Tensor] = None,
+    ) -> tuple[Tensor, Tensor]:
         """
         Args:
-            xyz: (B, N, 3)
+            xyz:         (B, N, 3)
+            fpn_context: (B, fpn_dim) — global FPN p2 context, optional.
+                         Если None — поведение v1 без FPN.
 
         Returns:
             cls_logits: (B, 1)
             reg_deltas: (B, 6)
         """
-        feat = self.extract_features(xyz)
+        feat = self.extract_features(xyz)   # (B, feat_dim)
+
+        # FPN слияние: конкат SA3-признак + FPN-проекция → объединение
+        if fpn_context is not None and self.fpn_proj is not None:
+            fpn_feat = self.fpn_proj(fpn_context)              # (B, feat_dim)
+            feat     = self.fusion(torch.cat([feat, fpn_feat], dim=-1))  # (B, feat_dim)
+
         return self.cls_head(feat), self.reg_head(feat)
