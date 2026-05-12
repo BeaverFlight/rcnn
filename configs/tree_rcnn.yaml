@@ -46,6 +46,36 @@ pointnet2:
       nsample: null
       mlp: [128, 256, 512]
 
+# ─── PointNeXt backbone ───────────────────────────────────────────────
+# Используется только если build_model увидит backbone: pointnext в конфиге.
+# Параметры по умолчанию соответствуют иерархии SA1/SA2/SA3-extra/Global
+# из tree_rcnn_v2.py. Менять только если знаешь что делаешь.
+pointnext:
+  # npoints, radii, nsamples — три SA-слоя (не считая Global)
+  npoints:  [512, 256, 128]
+  radii:    [2.0, 4.0, 8.0]
+  nsamples: [64,  64,  64]
+  # channels[i] — MLP-выходы i-го SA-слоя; channels[3] — Global SA
+  channels:
+    - [32,  64]    # SA1
+    - [64,  128]   # SA2
+    - [128, 256]   # SA3-extra
+    - [256, 512]   # SA-global
+
+# ─── Тайлинг (TrainingTiler) ──────────────────────────────────────────
+# enabled: true  — случайная нарезка тайлов в __getitem__ во время обучения
+# enabled: false — старый режим random subsampling (по умолчанию, v1-совместимо)
+tiling:
+  enabled: true
+  tile_size: 40.0       # метры — сторона квадратного тайла
+  overlap: 10.0         # метры — буферная зона для InferenceTiler
+  min_trees: 3          # минимум GT-деревьев в тайле, иначе retry
+  max_points: 32768     # максимум точек в тайле (случайная подвыборка если больше)
+  min_points: 100       # тайл считается пустым если точек меньше
+  max_attempts: 10      # попыток найти непустой тайл за один __getitem__
+  center_weight: 1.0    # вес score для центра тайла (InferenceTiler.merge)
+  border_weight: 0.5    # вес score для буферной зоны (InferenceTiler.merge)
+
 training:
   epochs: 5000
   batch_size: 1
