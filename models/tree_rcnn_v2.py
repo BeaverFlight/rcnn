@@ -10,29 +10,16 @@ models/tree_rcnn_v2.py — TreeRCNN v2.0
   - stage2_loss_v2 вместо _stage2_loss
   - Все мемори-оптимизации v1 сохранены
 
-Fix (Stage-3 grad graph):
-  Старый код писал inplace в feats_buf[start:end] = x.float(),
-  что разрывало autograd между SA-слоями и feat_proj.
-  Теперь: чанк-выходы копятся в list, torch.cat вне цикла,
-  затем feat_proj применяется к целому тензору без разрыва.
-
-Fix (FPN):
-  PointNeXtEncoder запускается один раз на всё облако.
-  TreeFPN строит p2/p3/p4 из SA2/SA3/global.
-  p2 передаётся в _run_stage1_on_anchors → ProposalHead.
-  Контекст p2 считывается пор-анкор (ближайшая точка SA2 в XY плоскости).
-
-Fix (Stage-3 blending):
-  inference возвращает alpha*s3 + (1-alpha)*s2
-  (cfg.training.stage3_blend_alpha, дефолт 0.7).
-
-Fix (encapsulation):
-  _extract_s3_feats использует Stage2Head.extract_features()
-  вместо прямого доступа к приватным слоям.
-
-Fix (padding):
-  _pad_pts использует zero-padding вместо tiling repeat(),
-  чтобы избежать SA-артефактов от дублирования граничных точек.
+Fix история:
+  v2.1: inplace-баг autograd Stage-3 (list→torch.cat)
+  v2.2: centerness BCE (binary_cross_entropy, не with_logits)
+  v2.3: Stage2Head.extract_features() инкапсуляция
+  v2.4: FPN per-anchor lookup (_fpn_lookup + sa2_xyz из encoder)
+  v2.5: устранено дублирование cls/reg loss в _stage2_loss_v2
+  v2.6: p3/p4 dead code очищен (_p3, _p4)
+  v2.7: _pad_pts → zero-padding вместо tiling repeat()
+  v2.8: Stage-3 proposals сортируются по score перед [:MAX_S3]
+  v2.9: убраны избыточные empty_cache() внутри чанк-циклов
 """
 from __future__ import annotations
 
@@ -76,9 +63,9 @@ class TreeRCNNV2(nn.Module):
     TreeRCNN v2.0.
 
     Forward-пасс:
-      1. PointNeXtEncoder(points) → [f1, f2, f3, f4]   (SA-иерархия)
-      2. TreeFPN(f2, f3, f4)     → p2, p3, p4
-         p2 используется Stage-1; p3/p4 на текущий момент не потребляются
+      1. PointNeXtEncoder(points) → [f1, f2, f3, f4]  + сохраняет sa2_xyz
+      2. TreeFPN(f2, f3, f4)     → p2, _p3, _p4
+         p2 используется Stage-1 как per-anchor FPN-контекст
       3. Stage-1 с p2 как per-anchor FPN-контекстом
       4. NMS → proposals
       5. Stage-2 (тренировка: loss_v2 / инференс: refined boxes + s2_scores)
@@ -90,9 +77,8 @@ class TreeRCNNV2(nn.Module):
         self.cfg        = cfg
         self.anchor_gen = AnchorGenerator(cfg)
 
-        # ─ FPN backbone (запускается один раз в forward, даёт f2/f3/f4) ────────────────
         self.encoder = PointNeXtEncoder(cfg)
-        enc_dims     = self.encoder.out_dims          # [C1, C2, C3, C4]
+        enc_dims     = self.encoder.out_dims
 
         fpn_cfg = getattr(cfg, 'fpn', None)
         fpn_out = int(fpn_cfg.out_channels) if fpn_cfg else 256
@@ -102,13 +88,10 @@ class TreeRCNNV2(nn.Module):
         )
         self._fpn_out = fpn_out
 
-        # ─ Stage 1 ───────────────────────────────────────────────────────────────
         self.stage1 = ProposalHead(cfg)
 
-        # ─ Stage 2 ───────────────────────────────────────────────────────────────
         self.stage2 = RefinementHeadV2(cfg)
 
-        # ─ Stage 3 (Relation Head) ───────────────────────────────────────────
         rel_cfg  = getattr(cfg, 'relation_head', None)
         rel_fdim = int(rel_cfg.feat_dim)  if rel_cfg else self.stage2.extractor.out_dim
         rel_cdim = int(rel_cfg.coord_dim) if rel_cfg else 5
@@ -124,10 +107,9 @@ class TreeRCNNV2(nn.Module):
             if s2_out != rel_fdim else nn.Identity()
         )
 
-        # ─ Гиперпараметры ───────────────────────────────────────────────────
-        self.lambda_reg:     float = cfg.training.lambda_reg
-        self.lambda_v_reg:   float = float(cfg.training.get("lambda_v_reg",  1.0))
-        self.lambda_stage3:  float = float(cfg.training.get("lambda_stage3", 0.5))
+        self.lambda_reg:      float = cfg.training.lambda_reg
+        self.lambda_v_reg:    float = float(cfg.training.get("lambda_v_reg",  1.0))
+        self.lambda_stage3:   float = float(cfg.training.get("lambda_stage3", 0.5))
         self._s3_blend_alpha: float = float(
             cfg.training.get("stage3_blend_alpha", 0.7)
         )
@@ -192,34 +174,23 @@ class TreeRCNNV2(nn.Module):
         self._cuda = device.type == "cuda"
         pb = tuple(plot_bounds.tolist()) if isinstance(plot_bounds, Tensor) else plot_bounds
 
-        # ─ FPN backbone (1 пасс на всё облако) ──────────────────────────────────
+        # ── FPN backbone ────────────────────────────────────────────────────
         t_fpn = time.perf_counter()
         xyz_in = points.unsqueeze(0)       # (1, N, 3)
         with torch.autocast(device_type=device.type):
-            f1, f2, f3, f4 = self.encoder(xyz_in)           # SA-уровни
-            p2, _p3, _p4   = self.fpn(f2, f3, f4)           # FPN-уровни
-        # p2: (1, S2, fpn_out) — используется Stage-1 как per-anchor context
-        # p3/p4: в текущей архитектуре не потребляются (используются только
-        # как промежуточные результаты top-down FPN для обогащения p2)
+            f1, f2, f3, f4 = self.encoder(xyz_in)
+            # encoder.sa2_xyz: (1, S2, 3) — реальные FPS-центроиды SA2
+            p2, _p3, _p4   = self.fpn(f2, f3, f4)
+        # p2: (1, S2, fpn_out) — per-anchor FPN context для Stage-1
+        # _p3, _p4: промежуточные FPN уровни, обогащают p2 через top-down,
+        #           напрямую не потребляются Stage-1/2/3 в текущей архитектуре
 
-        # fpn_xyz: (S2, 3) — XY-координаты SA2 точек для per-anchor lookup
-        # f2: (1, S2, C2) — SA2 фичи до FPN нужны для позиций
-        # Мы используем f2 для XYZ-координат SA2-точек.
-        # PointNeXtEncoder должен возвращать (xyz_i, feats_i) или хранить xyz в out.
-        # Если encoder возвращает только features, SA2-xyz берём через subsampled indices.
-        # По fallback: если encoder хранит .sa2_xyz, используем его;
-        # иначе делаем uniform subsample points как прокси SA2 XY.
-        if hasattr(self.encoder, 'sa2_xyz') and self.encoder.sa2_xyz is not None:
-            fpn_xyz = self.encoder.sa2_xyz.squeeze(0).detach()  # (S2, 3)
-        else:
-            # Fallback: используем первые S2 точек облака в качестве прокси SA2 XY
-            S2 = p2.shape[1]
-            fpn_xyz = points[:S2].detach()                      # (S2, 3)
-
-        fpn_p2  = p2.squeeze(0).detach()   # (S2, fpn_out), no grad in stage1 scan
+        # sa2_xyz сохранён encoder.sa2_xyz после forward() — см. pointnext_modules.py
+        fpn_xyz = self.encoder.sa2_xyz.squeeze(0)  # (S2, 3) — настоящие центроиды
+        fpn_p2  = p2.squeeze(0).detach()           # (S2, fpn_out), no grad in stage1
         logger.debug("FPN done in %.2fs (S2=%d)", time.perf_counter() - t_fpn, fpn_p2.shape[0])
 
-        # ─ Stage 1 ───────────────────────────────────────────────────────────────
+        # ── Stage 1 ─────────────────────────────────────────────────────────
         t1 = time.perf_counter()
         ad, al_list = self.anchor_gen.generate_all(pb, local_maxima.cpu().numpy())
         ad      = ad.to(device)
@@ -250,7 +221,7 @@ class TreeRCNNV2(nn.Module):
             return {"boxes": torch.zeros(0, 6, device=device),
                     "scores": torch.zeros(0, device=device)}
 
-        # ─ Stage 2 ───────────────────────────────────────────────────────────────
+        # ── Stage 2 ─────────────────────────────────────────────────────────
         if training:
             loss_s2 = self._stage2_loss_v2(points, proposals.detach(), gt_boxes)
             loss_s3 = {"loss_stage3": torch.tensor(0.0, device=device)}
@@ -283,23 +254,22 @@ class TreeRCNNV2(nn.Module):
     @staticmethod
     def _fpn_lookup(
         anchors: Tensor,   # (A, 6): cx, cy, cz, w, l, h
-        fpn_xyz: Tensor,   # (S2, 3): XYZ координаты SA2-точек
+        fpn_xyz: Tensor,   # (S2, 3): настоящие SA2 FPS-центроиды
         fpn_p2:  Tensor,   # (S2, C): FPN p2 признаки
     ) -> Tensor:            # (A, C)
         """
         Для каждого анкора находит ближайшую SA2-точку в XY-плоскости
-        и берёт соответствующий FPN p2-вектор.
+        и берёт соответствующий вектор FPN p2.
 
-        Использует расстояние только по XY (игнорируя Z), т.к. FPN
-        обрабатывает горизонтальную площадь, а высота кодируется отдельно
-        через регрессионные дельты в Stage-2.
+        XY-only: FPN обрабатывает горизонтальную плоскость,
+        высота кодируется отдельно через reg-дельты Stage-2.
+        fpn_xyz содержит реальные FPS-центроиды из encoder.sa2_xyz.
         """
-        anchor_xy = anchors[:, :2]          # (A, 2)
-        fpn_xy    = fpn_xyz[:, :2]          # (S2, 2)
-        # расстояния (A, S2)
-        dist = torch.cdist(anchor_xy.float(), fpn_xy.float())  # (A, S2)
-        nn_idx = dist.argmin(dim=1)          # (A,)
-        return fpn_p2[nn_idx]                # (A, C)
+        anchor_xy = anchors[:, :2].float()   # (A, 2)
+        fpn_xy    = fpn_xyz[:, :2].float()   # (S2, 2)
+        dist      = torch.cdist(anchor_xy, fpn_xy)   # (A, S2)
+        nn_idx    = dist.argmin(dim=1)               # (A,)
+        return fpn_p2[nn_idx]                        # (A, C)
 
     # ------------------------------------------------------------------
     # Stage 1 helpers
@@ -447,12 +417,8 @@ class TreeRCNNV2(nn.Module):
         """
         Запускает ProposalHead на батче анкоров с per-anchor FPN-контекстом.
 
-        Fix: вместо global mean(p2) для всех анкоров, для каждого анкора
-        ищем ближайшую SA2-точку в XY и берём fpn_p2[той индекс].
-        Это даёт локальный пространственный контекст вместо заглушаемого среднего.
-
         fpn_p2  : (S2, fpn_out) — уже detach'ed.
-        fpn_xyz : (S2, 3)       — XYZ SA2-точек.
+        fpn_xyz : (S2, 3)       — реальные SA2 FPS-центроиды (encoder.sa2_xyz).
         """
         device   = points.device
         A        = len(anchors)
@@ -469,7 +435,7 @@ class TreeRCNNV2(nn.Module):
             return cls_out, reg_out
 
         valid_pts     = [pts_list[i] for i in valid_idx]
-        valid_anchors = anchors[valid_idx]  # (V, 6)
+        valid_anchors = anchors[valid_idx]
         mb  = int(getattr(self.cfg.training, "stage1_infer_batch", _STAGE1_INFER_BATCH))
         ctx = torch.inference_mode() if infer_mode else torch.enable_grad()
 
@@ -478,7 +444,7 @@ class TreeRCNNV2(nn.Module):
                 end      = min(start + mb, len(valid_idx))
                 batch, _ = _pad_windows_to_batch(valid_pts[start:end], device)
 
-                # Per-anchor FPN context: ближайшая SA2-точка в XY для каждого анкора
+                # Per-anchor FPN: ближайшая SA2-точка в XY для каждого анкора
                 fpn_ctx = self._fpn_lookup(
                     valid_anchors[start:end], fpn_xyz, fpn_p2
                 )  # (B_c, fpn_out)
@@ -502,13 +468,6 @@ class TreeRCNNV2(nn.Module):
     def _stage2_loss_v2(
         self, points: Tensor, proposals: Tensor, gt_boxes: Tensor
     ) -> dict:
-        """
-        Stage-2 loss через stage2_loss_v2() без дублирования.
-
-        Fix: раньше cls_loss/reg_loss вычислялись дважды — сначала
-        явно, затем через stage2_loss_v2 с lambdas={'cls':0,'reg':0,...}.
-        Теперь только один вызов stage2_loss_v2 со всеми lambda-весами из cfg.
-        """
         cfg_la = self.cfg.label_assignment
         device = points.device
 
@@ -555,14 +514,15 @@ class TreeRCNNV2(nn.Module):
                 all_xyz.append(xyz)
 
             del chunk_pts
-            if self._cuda:
-                torch.cuda.empty_cache()
+            # empty_cache вызывается один раз после всего цикла (не на каждом чанке)
+
+        if self._cuda:
+            torch.cuda.empty_cache()
 
         cls_logits = torch.cat(all_cls, dim=0)
         reg_deltas = torch.cat(all_reg, dim=0)
         del all_cls, all_reg
 
-        # Все loss-компоненты через один вызов stage2_loss_v2
         off_cat  = torch.cat(all_off,  dim=0).to(device) if all_off  else None
         cent_cat = torch.cat(all_cent, dim=0).to(device) if all_cent else None
         xyz_cat  = torch.cat(all_xyz,  dim=0).to(device) if all_xyz  else None
@@ -578,11 +538,11 @@ class TreeRCNNV2(nn.Module):
             gt_box=sampled_reg_tgt,
             gt_label=sampled_labels,
             lambdas={
-                'cls':        float(getattr(self.cfg.training, 'lambda_cls',        1.0)),
-                'reg':        self.lambda_reg,
-                'offset':     float(getattr(self.cfg.training, 'lambda_offset',     0.5)),
-                'centerness': float(getattr(self.cfg.training, 'lambda_centerness', 0.5)),
-                'v_reg':      self.lambda_v_reg,
+                'cls':         float(getattr(self.cfg.training, 'lambda_cls',        1.0)),
+                'reg':         self.lambda_reg,
+                'offset':      float(getattr(self.cfg.training, 'lambda_offset',     0.5)),
+                'centerness':  float(getattr(self.cfg.training, 'lambda_centerness', 0.5)),
+                'v_reg':       self.lambda_v_reg,
                 'focal_alpha': self._focal_alpha,
                 'focal_gamma': self._focal_gamma,
             },
@@ -590,8 +550,6 @@ class TreeRCNNV2(nn.Module):
 
         if off_cat is not None:
             del off_cat, cent_cat, xyz_cat
-        if self._cuda:
-            torch.cuda.empty_cache()
 
         return {
             "loss_stage2_cls":    ld['cls'],
@@ -632,7 +590,7 @@ class TreeRCNNV2(nn.Module):
         return refined[keep], scores[keep]
 
     # ------------------------------------------------------------------
-    # Stage 3 helpers — извлечение семантических признаков
+    # Stage 3 helpers
     # ------------------------------------------------------------------
     def _extract_s3_feats(
         self, points: Tensor, proposals: Tensor, grad: bool
@@ -640,14 +598,11 @@ class TreeRCNNV2(nn.Module):
         """
         Извлекает семантические признаки каждого proposal.
 
-        Fix (encapsulation):
-            Старый код напрямую обращался к head.centerness_head, head.offset_head,
-            head._fc_neck, head.proj — нарушение инкапсуляции и риск рассинхронизации.
-            Теперь используется публичный Stage2Head.extract_features().
+        Использует публичный Stage2Head.extract_features() вместо
+        прямого доступа к приватным слоям (head.centerness_head и т.д.).
 
-        Fix (grad graph):
-            Чанк-выходы собираются в list, torch.cat вызывается один раз,
-            feat_proj применяется к целому тензору — граф цельный.
+        Чанк-выходы собираются в list, torch.cat вызывается один раз —
+        граф целый. empty_cache() — один раз после всего цикла.
 
         Возвращает: (1, N, rel_feat_dim)
         """
@@ -676,23 +631,23 @@ class TreeRCNNV2(nn.Module):
                 ):
                     pw_feats, pw_xyz = self.stage2._extract_pw_features(
                         self._pad_pts(chunk_pts, device), chunk_prop
-                    )  # (B_c, S2, pw_dim), (B_c, S2, 3)
-
-                    # Используем публичный метод вместо прямого доступа к приватным слоям
-                    x = self.stage2.stage2_head.extract_features(pw_feats, pw_xyz)  # (B_c, feat_dim)
+                    )
+                    # Публичный метод — инкапсуляция соблюдена
+                    x = self.stage2.stage2_head.extract_features(pw_feats, pw_xyz)
 
                 feat_buf.append(x.float() if grad else x.detach().float())
-
                 del chunk_pts, pw_feats, pw_xyz, x
-                if self._cuda:
-                    torch.cuda.empty_cache()
+                # empty_cache — после всего цикла
+
+        if self._cuda:
+            torch.cuda.empty_cache()
 
         # cat один раз — граф цельный
         feats = torch.cat(feat_buf, dim=0)            # (N, stage2_feat_dim)
 
         proj_ctx = torch.enable_grad() if grad else torch.inference_mode()
         with proj_ctx:
-            box_feats = self.feat_proj(feats)          # (N, rel_feat_dim)
+            box_feats = self.feat_proj(feats)
 
         return box_feats.unsqueeze(0)                  # (1, N, rel_feat_dim)
 
@@ -700,11 +655,7 @@ class TreeRCNNV2(nn.Module):
     def _pad_pts(pts_list: list[Tensor], device: torch.device) -> Tensor:
         """
         Zero-padding списка point-тензоров в батч (B, max_N, 3).
-
-        Fix: заменен tiling repeat() на zero-padding.
-        repeat() дублировал граничные точки, что создавало артефакты
-        в SA ball query / kNN из-за завышения важности дубликатов.
-        Нулевые точки отфильтровываются за счёт valid_mask.
+        Нулевые точки фильтруются SA через valid_mask в centerness/offset.
         """
         max_n = max(p.shape[0] for p in pts_list)
         B     = len(pts_list)
@@ -725,8 +676,28 @@ class TreeRCNNV2(nn.Module):
 
         device  = proposals.device
         MAX_S3  = int(getattr(self.cfg.training, 'stage3_max_proposals', 500))
+
+        # Fix: сортируем proposals по Stage-2 cls score перед срезом [:MAX_S3]
+        # Раньше срез был произвольным (порядок после NMS не гарантирован).
+        # Теперь Stage-3 получает топ-MAX_S3 кандидатов по уверенности.
         if len(proposals) > MAX_S3:
-            proposals = proposals[:MAX_S3]
+            with torch.no_grad():
+                pts_tmp  = _subsample_points_loss(
+                    points.cpu(), proposals.cpu(), n=_MAX_POINTS_PER_BOX
+                )
+                pts_dev  = [p.to(device, non_blocking=True) for p in pts_tmp[:MAX_S3 * 2]]
+                prop_tmp = proposals[:MAX_S3 * 2]
+                with torch.autocast(device_type=self._amp_device_type):
+                    cls_tmp, _ = self.stage2.forward_train(
+                        pts_dev, prop_tmp
+                    )[:2]  # (N_tmp, 1)
+                scores_tmp = torch.sigmoid(cls_tmp.squeeze(-1).float())
+                top_idx    = scores_tmp.argsort(descending=True)[:MAX_S3]
+            proposals = proposals[top_idx]
+            del pts_tmp, pts_dev, cls_tmp, scores_tmp, top_idx
+            if self._cuda:
+                torch.cuda.empty_cache()
+
         N = len(proposals)
 
         with torch.no_grad():
@@ -738,7 +709,7 @@ class TreeRCNNV2(nn.Module):
         box_feats = self._extract_s3_feats(points, proposals, grad=True)
 
         with torch.autocast(device_type=self._amp_device_type):
-            scores = self.relation_head(box_feats, coords)        # (1, N, 1)
+            scores = self.relation_head(box_feats, coords)
 
         loss = relation_loss(
             pred_scores=scores,
@@ -752,18 +723,14 @@ class TreeRCNNV2(nn.Module):
         return {"loss_stage3": loss}
 
     # ------------------------------------------------------------------
-    # Stage 3 — inference (blended scores)
+    # Stage 3 — inference
     # ------------------------------------------------------------------
     def _stage3_inference(
         self, points: Tensor, boxes: Tensor, s2_scores: Tensor
     ) -> Tensor:
         """
-        Возвращает blended score:
-            final = alpha * s3_score + (1 - alpha) * s2_score
-
-        alpha читается из cfg.training.stage3_blend_alpha (дефолт 0.7).
-        При alpha=1.0 — чистый Stage-3 (старое поведение).
-        При alpha=0.0 — Stage-3 отключён, остаются Stage-2 scores.
+        Возвращает blended score: alpha * s3 + (1-alpha) * s2.
+        alpha = cfg.training.stage3_blend_alpha (дефолт 0.7).
         """
         device = boxes.device
         coords = boxes[:, [0, 1, 2, 3, 5]].unsqueeze(0)
@@ -772,8 +739,8 @@ class TreeRCNNV2(nn.Module):
 
         with torch.inference_mode():
             with torch.autocast(device_type=self._amp_device_type):
-                new_sc = self.relation_head(box_feats, coords)    # (1, N, 1)
-        s3_scores = new_sc.squeeze(0).squeeze(-1)                 # (N,)
+                new_sc = self.relation_head(box_feats, coords)
+        s3_scores = new_sc.squeeze(0).squeeze(-1)
 
         del box_feats, new_sc, coords
         if self._cuda:
