@@ -9,6 +9,10 @@ models/losses/stage2_v2.py — Stage-2 loss для TreeRCNN v2
 
 Веса управляются через словарь lambdas (все значения опциональны, дефолты ниже).
 Дефолтные веса из конфига cfg.training — передаются в tree_rcnn_v2.
+
+Fix: centerness BCE — используется F.binary_cross_entropy (не with_logits),
+     т.к. Stage2Head.centerness_head уже применяет Sigmoid на выходе.
+     pred_centerness содержит значения [0..1], а не logits.
 """
 from __future__ import annotations
 
@@ -49,7 +53,7 @@ def stage2_loss_v2(
     cls_score:       Tensor,         # (S, 1)      logits
     reg_delta:       Tensor,         # (S, 6)      регрессионные дельты
     pred_offsets:    Tensor | None,  # (S, N2, 3)  voting offsets (CPU или GPU)
-    pred_centerness: Tensor | None,  # (S, N2, 1)  centerness logits
+    pred_centerness: Tensor | None,  # (S, N2, 1)  centerness scores [0..1] (уже sigmoid!)
     points_xyz:      Tensor | None,  # (S, N2, 3)  координаты точек
     gt_box:          Tensor,         # (S, 6)      target регрессия
     gt_label:        Tensor,         # (S,)        {0, 1}
@@ -62,6 +66,10 @@ def stage2_loss_v2(
         offset     — voting offset loss
         centerness — BCE + Dice centerness
         total      — взвешенная сумма
+
+    ВАЖНО: pred_centerness должен содержать значения [0..1] (уже после Sigmoid),
+    т.к. Stage2Head.centerness_head применяет nn.Sigmoid() на выходе.
+    Для loss используется F.binary_cross_entropy (не with_logits).
     """
     L = _merge(_DEFAULTS, lambdas)
     device = cls_score.device
@@ -111,10 +119,16 @@ def stage2_loss_v2(
 
     # -----------------------------------------------------------------
     # 4. Centerness loss = BCE + Dice
+    #
+    # Fix: pred_centerness уже прошёл через nn.Sigmoid() в Stage2Head,
+    # поэтому используем F.binary_cross_entropy (не with_logits).
+    # Это исправляет ошибку двойного sigmoid (logits → sigmoid → sigmoid),
+    # которая приводила к неверным градиентам и зажатию весов centerness_head.
     # -----------------------------------------------------------------
     cent_loss = zero
     if pred_centerness is not None and pos_mask.any() and points_xyz is not None:
-        cent_logits = pred_centerness[pos_mask].to(device).squeeze(-1)  # (P, N2)
+        # pred_centerness: значения в [0..1] (после Sigmoid в centerness_head)
+        cent_probs  = pred_centerness[pos_mask].to(device).squeeze(-1)  # (P, N2)
         xyz_pos     = points_xyz[pos_mask].to(device)                   # (P, N2, 3)
         gt_ctr      = gt_box[pos_mask, :3].to(device)                   # (P, 3)
         gt_wlh      = gt_box[pos_mask, 3:].to(device)                   # (P, 3): w, l, h
@@ -126,10 +140,15 @@ def stage2_loss_v2(
         gt_cent = torch.exp(-dist2d / half_r.unsqueeze(1))                            # (P, N2)
 
         valid_pts = (xyz_pos.abs().sum(-1) > 0).float()  # (P, N2)
-        bce_c  = F.binary_cross_entropy_with_logits(
-            cent_logits, gt_cent, reduction='none'
+
+        # BCE с уже-sigmoid предсказаниями (не with_logits!)
+        bce_c  = F.binary_cross_entropy(
+            cent_probs.clamp(1e-6, 1.0 - 1e-6),  # числовая стабильность
+            gt_cent,
+            reduction='none',
         )
-        dice_c = dice_loss(cent_logits, gt_cent, reduction='mean')
+        # dice_loss ожидает predictions в [0..1] — cent_probs уже корректны
+        dice_c = dice_loss(cent_probs, gt_cent, reduction='mean')
         cent_loss = (
             L["cent_bce_w"]  * (bce_c * valid_pts).mean()
             + L["cent_dice_w"] * dice_c
