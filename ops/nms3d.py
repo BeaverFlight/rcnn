@@ -1,6 +1,15 @@
-"""3D Non-Maximum Suppression using IoUv — fully vectorised GPU implementation."""
+"""3D Non-Maximum Suppression using IoUv — fully vectorised GPU implementation.
+
+Содержит:
+  nms3d      — hard NMS (оригинал)
+  soft_nms3d — Soft-NMS с Gaussian-decay (новый)
+               вместо подавления боксов снижает их scores пропорционально IoU,
+               что сохраняет перекрывающиеся деревья с разумным score.
+"""
 
 from __future__ import annotations
+
+import math
 
 import torch
 from torch import Tensor
@@ -9,7 +18,6 @@ from ops.iou3d import iou_volume
 
 # Максимум боксов для одного матричного IoU-расчёта.
 # При 22GB VRAM: 6000×6000 float32 = ~144MB — безопасно.
-# Увеличь если VRAM > 40GB; уменьши до 3000 при OOM.
 _NMS_CHUNK = 6000
 
 
@@ -104,3 +112,109 @@ def nms3d(
 
     # маппинг: sorted → pre-filter → original
     return orig_idx[order[keep_sorted]]
+
+
+def soft_nms3d(
+    boxes: Tensor,
+    scores: Tensor,
+    iou_threshold: float,
+    sigma: float = 0.5,
+    score_threshold: float = 0.001,
+    max_output: int | None = None,
+) -> tuple[Tensor, Tensor]:
+    """
+    Soft-NMS с Gaussian-decay для 3D боксов (IoUv).
+
+    Вместо жёсткого подавления боксов снижает score конкурирующих боксов
+    пропорционально их IoU с выбранным кандидатом:
+        score_j ← score_j * exp(-IoU(i,j)² / sigma)
+
+    Это позволяет сохранить перекрывающиеся деревья (типичная ситуация при
+    густом лесе), не выбрасывая их полностью, а лишь понижая уверенность.
+
+    Алгоритм O(N²) итеративный (greedy, как оригинальный Soft-NMS):
+      1. Сортируем по score
+      2. Берём максимальный бокс → добавляем в keep
+      3. Для всех оставшихся пересчитываем score через Gaussian
+      4. Повторяем пока score_max >= score_threshold
+
+    Args:
+        boxes:            (N, 6) [x, y, z_c, w, l, h]
+        scores:           (N,) — будут изменены in-place (копия внутри)
+        iou_threshold:    NMS не применяется напрямую, но используется
+                          как reference для sigma-масштабирования
+        sigma:            ширина Gaussian-окна (default 0.5)
+        score_threshold:  порог score для остановки (default 0.001)
+        max_output:       максимум боксов на выходе
+
+    Returns:
+        keep:        (K,) индексы в исходном массиве
+        new_scores:  (K,) обновлённые scores после decay
+    """
+    if boxes.numel() == 0:
+        device = boxes.device
+        return (
+            torch.zeros(0, dtype=torch.long, device=device),
+            torch.zeros(0, dtype=torch.float, device=device),
+        )
+
+    device = boxes.device
+    N = len(boxes)
+    scores_work = scores.clone().float()
+
+    # Маппинг: позиция → исходный индекс
+    indices = torch.arange(N, device=device)
+
+    keep_idx: list[int] = []
+    keep_sc:  list[float] = []
+
+    for _ in range(N):
+        if scores_work.numel() == 0:
+            break
+        # Выбираем лучший из оставшихся
+        best_pos = int(scores_work.argmax().item())
+        best_score = float(scores_work[best_pos].item())
+        if best_score < score_threshold:
+            break
+
+        best_orig = int(indices[best_pos].item())
+        keep_idx.append(best_orig)
+        keep_sc.append(best_score)
+
+        if max_output is not None and len(keep_idx) >= max_output:
+            break
+
+        # Убираем выбранный бокс из рабочего набора
+        best_box = boxes[best_orig].unsqueeze(0)  # (1, 6)
+
+        # Все оставшиеся (кроме best_pos)
+        rest_mask = torch.ones(len(scores_work), dtype=torch.bool, device=device)
+        rest_mask[best_pos] = False
+
+        if not rest_mask.any():
+            break
+
+        rest_indices = indices[rest_mask]
+        rest_scores  = scores_work[rest_mask]
+        rest_boxes   = boxes[rest_indices]  # (M, 6)
+
+        # IoU между best и всеми оставшимися
+        iou = iou_volume(best_box, rest_boxes).squeeze(0)  # (M,)
+
+        # Gaussian decay: score_j *= exp(-iou² / sigma)
+        decay = torch.exp(-(iou ** 2) / sigma)
+        rest_scores = rest_scores * decay
+
+        # Обновляем рабочие массивы
+        indices     = rest_indices
+        scores_work = rest_scores
+
+    if not keep_idx:
+        return (
+            torch.zeros(0, dtype=torch.long, device=device),
+            torch.zeros(0, dtype=torch.float, device=device),
+        )
+
+    keep_t    = torch.tensor(keep_idx, dtype=torch.long,  device=device)
+    keep_sc_t = torch.tensor(keep_sc,  dtype=torch.float, device=device)
+    return keep_t, keep_sc_t
